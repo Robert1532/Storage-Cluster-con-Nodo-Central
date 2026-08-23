@@ -1,0 +1,12 @@
+# Practica 1 - Storage Cluster CNS
+# Python 3.12
+#
+# Instalar:  pip install -r requirements.txt
+# Verificar: python -c "import psutil, mysql.connector, fastapi; print('ok')"
+
+psutil==6.1.0
+mysql-connector-python==9.1.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1

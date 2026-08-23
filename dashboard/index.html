@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Cluster CNS</title>
+<!--
+  Dashboard — modulo M4.  Responsable: Alex.
+
+  ESQUELETO FUNCIONAL: ya consume la API y pinta la tabla, los KPIs y el
+  auto-refresh. Lo que falta esta marcado con TODO Alex.
+  Se sirve desde la misma API: http://IP:8000
+-->
+<style>
+  :root{
+    --bg:#0f1319; --card:#171d26; --line:#28313d;
+    --txt:#e6ebf2; --soft:#93a0b1;
+    --ok:#3ec98a; --mal:#ef6a58; --warn:#e6b23c; --acc:#3fb8b0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);
+         display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+  h1{margin:0;font-size:20px;letter-spacing:-.01em}
+  .ctrl{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--soft)}
+  select{background:var(--card);color:var(--txt);border:1px solid var(--line);
+         padding:6px 10px;border-radius:4px;font-size:13px}
+  main{padding:24px;max-width:1400px;margin:0 auto}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+  .kpi span{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft)}
+  .kpi b{display:block;font-size:30px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
+  .kpi.grande b{font-size:40px;color:var(--acc)}
+  table{width:100%;border-collapse:collapse;background:var(--card);
+        border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  th{background:#1e2631;text-align:left;padding:11px 14px;font-size:11px;
+     letter-spacing:.08em;text-transform:uppercase;color:var(--soft);white-space:nowrap}
+  td{padding:11px 14px;border-top:1px solid var(--line);font-size:14px}
+  .pill{padding:3px 9px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
+  .pill.on{background:rgba(62,201,138,.15);color:var(--ok)}
+  .pill.off{background:rgba(239,106,88,.15);color:var(--mal)}
+  .barra{height:7px;background:#232c38;border-radius:99px;overflow:hidden;min-width:90px}
+  .barra i{display:block;height:100%;background:var(--ok)}
+  .barra i.medio{background:var(--warn)} .barra i.alto{background:var(--mal)}
+  .num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .caja{background:var(--card);border:1px solid var(--line);border-radius:6px;
+        padding:16px 18px;margin-top:24px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  input,button{background:#1e2631;color:var(--txt);border:1px solid var(--line);
+               padding:8px 12px;border-radius:4px;font-size:13px}
+  button{cursor:pointer;border-color:var(--acc);color:var(--acc)}
+  button:hover{background:var(--acc);color:#0f1319}
+  #eco{font-size:12px;color:var(--soft);margin-left:auto}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Storage Cluster · Caja Nacional de Salud</h1>
+  <div class="ctrl">
+    <label>Auto-refresh
+      <select id="refresco">
+        <option value="2">2 s</option>
+        <option value="5" selected>5 s</option>
+        <option value="10">10 s</option>
+        <option value="30">30 s</option>
+      </select>
+    </label>
+    <span id="ultima">—</span>
+  </div>
+</header>
+
+<main>
+  <div class="kpis" id="kpis"></div>
+  <table>
+    <thead>
+      <tr>
+        <th>Nodo</th><th>Regional</th><th>SO</th><th>Disco</th><th>Tipo</th>
+        <th>Capacidad</th><th>Usado</th><th>Libre</th><th>Utilización</th>
+        <th>Estado</th><th>Último reporte</th>
+      </tr>
+    </thead>
+    <tbody id="filas"></tbody>
+  </table>
+
+  <div class="caja">
+    <strong style="font-size:13px">Enviar mensaje a un nodo</strong>
+    <select id="destino"></select>
+    <select id="texto">
+      <option>Reinicie servicio</option>
+      <option>Verifique espacio en disco</option>
+      <option>Actualización de configuración</option>
+    </select>
+    <button id="enviar">Enviar</button>
+    <span id="eco"></span>
+  </div>
+</main>
+
+<script>
+const API = "";                    // misma URL que sirve el dashboard
+let timer = null;
+
+const gb = v => v == null ? "—" : Number(v).toLocaleString("es-BO",
+  {minimumFractionDigits:1, maximumFractionDigits:1}) + " GB";
+const hora = t => t ? new Date(t).toLocaleTimeString("es-BO") : "nunca";
+
+async function cargar(){
+  try{
+    const [nodos, cl] = await Promise.all([
+      fetch(API+"/api/nodes").then(r=>r.json()),
+      fetch(API+"/api/cluster").then(r=>r.json())
+    ]);
+    pintarKpis(cl);
+    pintarTabla(nodos);
+    document.getElementById("ultima").textContent =
+      "actualizado " + new Date().toLocaleTimeString("es-BO");
+  }catch(e){
+    document.getElementById("ultima").textContent = "sin conexión con la API";
+  }
+}
+
+function pintarKpis(c){
+  const pct = Number(c.uso_pct_global ?? 0);
+  document.getElementById("kpis").innerHTML = `
+    <div class="kpi grande"><span>Utilización global</span><b>${pct.toFixed(1)}%</b></div>
+    <div class="kpi"><span>Capacidad total</span><b>${gb(c.capacidad_total_gb)}</b></div>
+    <div class="kpi"><span>Espacio libre</span><b>${gb(c.libre_total_gb)}</b></div>
+    <div class="kpi"><span>Nodos activos</span><b>${c.nodos_activos} / ${c.nodos_totales}</b></div>`;
+}
+
+function pintarTabla(nodos){
+  const dest = document.getElementById("destino");
+  if(dest.options.length !== nodos.length)
+    dest.innerHTML = nodos.map(n=>`<option value="${n.node_id}">${n.node_id}</option>`).join("");
+
+  document.getElementById("filas").innerHTML = nodos.map(n=>{
+    const pct = Number(n.uso_pct ?? 0);
+    const cls = pct >= 90 ? "alto" : pct >= 80 ? "medio" : "";
+    const on  = n.estado === "ACTIVO";
+    return `<tr>
+      <td><b>${n.node_id}</b></td>
+      <td>${n.region}</td>
+      <td>${n.sistema_operativo ?? "—"}</td>
+      <td>${n.disco_nombre ?? "—"}</td>
+      <td>${n.disco_tipo ?? "—"}</td>
+      <td class="num">${gb(n.total_gb)}</td>
+      <td class="num">${gb(n.usado_gb)}</td>
+      <td class="num">${gb(n.libre_gb)}</td>
+      <td><div class="barra"><i class="${cls}" style="width:${pct}%"></i></div>
+          <small class="num">${pct.toFixed(1)}%</small></td>
+      <td><span class="pill ${on?"on":"off"}">${on?"ACTIVO":"NO REPORTA"}</span></td>
+      <td class="num">${hora(n.ultimo_reporte)}</td>
+    </tr>`;
+  }).join("");
+}
+
+document.getElementById("enviar").onclick = async () => {
+  const node_id = document.getElementById("destino").value;
+  const texto   = document.getElementById("texto").value;
+  const r = await fetch(API+"/api/message", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({node_id, texto})
+  }).then(r=>r.json());
+  document.getElementById("eco").textContent = `Encolado ${r.cmd_id.slice(0,8)}… esperando ACK`;
+  // TODO Alex: consultar /api/messages y mostrar el ACK cuando llegue,
+  //          con el round-trip en ms (tarea 4.5).
+};
+
+function reprogramar(){
+  clearInterval(timer);
+  timer = setInterval(cargar, Number(document.getElementById("refresco").value) * 1000);
+}
+document.getElementById("refresco").onchange = reprogramar;
+
+cargar();
+reprogramar();
+
+// TODO Alex: grafico historico con /api/history/<node_id> (tarea 4.6, opcional).
+</script>
+</body>
+</html>
