@@ -27,13 +27,16 @@
   select{background:var(--card);color:var(--txt);border:1px solid var(--line);
          padding:6px 10px;border-radius:4px;font-size:13px}
   main{padding:24px;max-width:1400px;margin:0 auto}
+  #aviso{display:none;background:rgba(239,106,88,.12);border:1px solid var(--mal);
+         color:var(--mal);padding:12px 16px;border-radius:6px;margin-bottom:20px;font-size:14px}
   .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
   .kpi{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
   .kpi span{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft)}
   .kpi b{display:block;font-size:30px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
   .kpi.grande b{font-size:40px;color:var(--acc)}
+  .tabla-wrap{overflow-x:auto}
   table{width:100%;border-collapse:collapse;background:var(--card);
-        border:1px solid var(--line);border-radius:6px;overflow:hidden}
+        border:1px solid var(--line);border-radius:6px;overflow:hidden;min-width:900px}
   th{background:#1e2631;text-align:left;padding:11px 14px;font-size:11px;
      letter-spacing:.08em;text-transform:uppercase;color:var(--soft);white-space:nowrap}
   td{padding:11px 14px;border-top:1px solid var(--line);font-size:14px}
@@ -49,8 +52,10 @@
   input,button{background:#1e2631;color:var(--txt);border:1px solid var(--line);
                padding:8px 12px;border-radius:4px;font-size:13px}
   button{cursor:pointer;border-color:var(--acc);color:var(--acc)}
-  button:hover{background:var(--acc);color:#0f1319}
+  button:hover:not(:disabled){background:var(--acc);color:#0f1319}
+  button:disabled{opacity:.45;cursor:not-allowed}
   #eco{font-size:12px;color:var(--soft);margin-left:auto}
+  #eco.error{color:var(--mal)}
 </style>
 </head>
 <body>
@@ -71,17 +76,20 @@
 </header>
 
 <main>
+  <div id="aviso"></div>
   <div class="kpis" id="kpis"></div>
-  <table>
-    <thead>
-      <tr>
-        <th>Nodo</th><th>Regional</th><th>SO</th><th>Disco</th><th>Tipo</th>
-        <th>Capacidad</th><th>Usado</th><th>Libre</th><th>Utilización</th>
-        <th>Estado</th><th>Último reporte</th>
-      </tr>
-    </thead>
-    <tbody id="filas"></tbody>
-  </table>
+  <div class="tabla-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Nodo</th><th>Regional</th><th>SO</th><th>Disco</th><th>Tipo</th>
+          <th>Capacidad</th><th>Usado</th><th>Libre</th><th>Utilización</th>
+          <th>Estado</th><th>Último reporte</th>
+        </tr>
+      </thead>
+      <tbody id="filas"></tbody>
+    </table>
+  </div>
 
   <div class="caja">
     <strong style="font-size:13px">Enviar mensaje a un nodo</strong>
@@ -91,31 +99,82 @@
       <option>Verifique espacio en disco</option>
       <option>Actualización de configuración</option>
     </select>
-    <button id="enviar">Enviar</button>
+    <button id="enviar" disabled>Enviar</button>
     <span id="eco"></span>
   </div>
 </main>
 
 <script>
+"use strict";
 const API = "";                    // misma URL que sirve el dashboard
 let timer = null;
+let cargando = false;              // evita que se solapen dos refrescos
+let idsActuales = "";              // para saber si hay que repintar el selector
 
-const gb = v => v == null ? "—" : Number(v).toLocaleString("es-BO",
-  {minimumFractionDigits:1, maximumFractionDigits:1}) + " GB";
-const hora = t => t ? new Date(t).toLocaleTimeString("es-BO") : "nunca";
+// --------------------------------------------------------------- utilidades
+
+// TODO lo que venga de la base pasa por aqui antes de entrar en innerHTML.
+// No es paranoia: `region`, `hostname` y `disco_nombre` los manda el CLIENTE
+// por el socket. Cualquiera en la LAN puede conectarse al puerto 5050 y
+// registrarse con region "<img src=x onerror=...>", y ese texto se guardaria y
+// se ejecutaria en el navegador de todos los que miren el dashboard.
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const gb = v => (v === null || v === undefined || isNaN(Number(v)))
+  ? "—"
+  : Number(v).toLocaleString("es-BO",
+      {minimumFractionDigits:1, maximumFractionDigits:1}) + " GB";
+
+// La API devuelve las fechas en UTC y sin la "Z" final, asi que hay que
+// agregarsela: si no, el navegador las interpreta como hora local y el
+// "ultimo reporte" sale corrido 4 horas.
+// Se muestra fecha Y hora: un nodo caido hace tres dias con solo "14:32"
+// parece reciente.
+const fechaHora = t => {
+  if (!t) return "nunca";
+  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
+  const d = new Date(iso);
+  return isNaN(d) ? "—" : d.toLocaleString("es-BO",
+    {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"});
+};
+
+// fetch NO lanza con 4xx/5xx: devuelve la respuesta de error, y sin este
+// control el dashboard pintaria {"detail": "..."} como si fueran datos —
+// mostrando 0% de utilizacion cuando en realidad la base esta caida.
+async function pedir(ruta){
+  const r = await fetch(API + ruta);
+  if (!r.ok) throw new Error(`${ruta} respondio ${r.status}`);
+  return r.json();
+}
+
+function mostrarAviso(texto){
+  const a = document.getElementById("aviso");
+  if (texto) { a.textContent = texto; a.style.display = "block"; }
+  else { a.style.display = "none"; }
+}
+
+// ------------------------------------------------------------------- carga
 
 async function cargar(){
+  if (cargando) return;            // el refresco anterior sigue en vuelo
+  cargando = true;
   try{
     const [nodos, cl] = await Promise.all([
-      fetch(API+"/api/nodes").then(r=>r.json()),
-      fetch(API+"/api/cluster").then(r=>r.json())
+      pedir("/api/nodes"),
+      pedir("/api/cluster")
     ]);
+    mostrarAviso("");
     pintarKpis(cl);
     pintarTabla(nodos);
     document.getElementById("ultima").textContent =
       "actualizado " + new Date().toLocaleTimeString("es-BO");
   }catch(e){
+    mostrarAviso("No se pudo leer la API: " + e.message +
+                 ". Los datos de abajo pueden estar desactualizados.");
     document.getElementById("ultima").textContent = "sin conexión con la API";
+  }finally{
+    cargando = false;
   }
 }
 
@@ -125,46 +184,90 @@ function pintarKpis(c){
     <div class="kpi grande"><span>Utilización global</span><b>${pct.toFixed(1)}%</b></div>
     <div class="kpi"><span>Capacidad total</span><b>${gb(c.capacidad_total_gb)}</b></div>
     <div class="kpi"><span>Espacio libre</span><b>${gb(c.libre_total_gb)}</b></div>
-    <div class="kpi"><span>Nodos activos</span><b>${c.nodos_activos} / ${c.nodos_totales}</b></div>`;
+    <div class="kpi"><span>Nodos activos</span><b>${Number(c.nodos_activos ?? 0)} / ${Number(c.nodos_totales ?? 0)}</b></div>`;
 }
 
 function pintarTabla(nodos){
-  const dest = document.getElementById("destino");
-  if(dest.options.length !== nodos.length)
-    dest.innerHTML = nodos.map(n=>`<option value="${n.node_id}">${n.node_id}</option>`).join("");
+  actualizarSelector(nodos);
+
+  if (!nodos.length){
+    document.getElementById("filas").innerHTML =
+      `<tr><td colspan="11" style="text-align:center;color:var(--soft);padding:28px">
+         Todavía no hay nodos registrados. Levantá los clientes.
+       </td></tr>`;
+    return;
+  }
 
   document.getElementById("filas").innerHTML = nodos.map(n=>{
     const pct = Number(n.uso_pct ?? 0);
     const cls = pct >= 90 ? "alto" : pct >= 80 ? "medio" : "";
     const on  = n.estado === "ACTIVO";
     return `<tr>
-      <td><b>${n.node_id}</b></td>
-      <td>${n.region}</td>
-      <td>${n.sistema_operativo ?? "—"}</td>
-      <td>${n.disco_nombre ?? "—"}</td>
-      <td>${n.disco_tipo ?? "—"}</td>
+      <td><b>${esc(n.node_id)}</b></td>
+      <td>${esc(n.region)}</td>
+      <td>${esc(n.sistema_operativo ?? "—")}</td>
+      <td>${esc(n.disco_nombre ?? "—")}</td>
+      <td>${esc(n.disco_tipo ?? "—")}</td>
       <td class="num">${gb(n.total_gb)}</td>
       <td class="num">${gb(n.usado_gb)}</td>
       <td class="num">${gb(n.libre_gb)}</td>
-      <td><div class="barra"><i class="${cls}" style="width:${pct}%"></i></div>
+      <td><div class="barra"><i class="${cls}" style="width:${Math.min(100, Math.max(0, pct))}%"></i></div>
           <small class="num">${pct.toFixed(1)}%</small></td>
       <td><span class="pill ${on?"on":"off"}">${on?"ACTIVO":"NO REPORTA"}</span></td>
-      <td class="num">${hora(n.ultimo_reporte)}</td>
+      <td class="num">${fechaHora(n.ultimo_reporte)}</td>
     </tr>`;
   }).join("");
 }
 
+// Se compara la LISTA de ids, no la cantidad: si solo se mira el numero, un
+// nodo que se reemplaza por otro deja el selector apuntando al que ya no esta.
+// Y se restaura la seleccion despues de repintar, porque durante la demo del
+// alta automatica (requisito 7.2) aparece un nodo nuevo y el selector se
+// reiniciaria justo mientras el operador tiene otro elegido.
+function actualizarSelector(nodos){
+  const dest = document.getElementById("destino");
+  const ids = nodos.map(n => n.node_id).join("|");
+  if (ids !== idsActuales){
+    const elegido = dest.value;
+    dest.innerHTML = nodos.map(n =>
+      `<option value="${esc(n.node_id)}">${esc(n.node_id)}</option>`).join("");
+    if (nodos.some(n => n.node_id === elegido)) dest.value = elegido;
+    idsActuales = ids;
+  }
+  document.getElementById("enviar").disabled = nodos.length === 0;
+}
+
+// -------------------------------------------------------------- mensajeria
+
 document.getElementById("enviar").onclick = async () => {
+  const boton = document.getElementById("enviar");
+  const eco = document.getElementById("eco");
   const node_id = document.getElementById("destino").value;
   const texto   = document.getElementById("texto").value;
-  const r = await fetch(API+"/api/message", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({node_id, texto})
-  }).then(r=>r.json());
-  document.getElementById("eco").textContent = `Encolado ${r.cmd_id.slice(0,8)}… esperando ACK`;
-  // TODO Alex: consultar /api/messages y mostrar el ACK cuando llegue,
-  //          con el round-trip en ms (tarea 4.5).
+  if (!node_id) return;
+
+  boton.disabled = true;
+  eco.className = "";
+  eco.textContent = "Enviando…";
+  try{
+    const r = await fetch(API + "/api/message", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({node_id, texto})
+    });
+    const cuerpo = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(cuerpo.detail || `HTTP ${r.status}`);
+    eco.textContent = `Encolado ${String(cuerpo.cmd_id).slice(0,8)}… esperando ACK`;
+    // TODO Alex: consultar /api/messages?node_id=… y mostrar el ACK cuando
+    //            llegue, con el round-trip en ms (campo rtt_ms, tarea 4.5).
+  }catch(e){
+    eco.className = "error";
+    eco.textContent = "No se pudo enviar: " + e.message;
+  }finally{
+    boton.disabled = false;
+  }
 };
+
+// ------------------------------------------------------------ auto-refresh
 
 function reprogramar(){
   clearInterval(timer);
@@ -172,10 +275,18 @@ function reprogramar(){
 }
 document.getElementById("refresco").onchange = reprogramar;
 
+// Con la pestana en segundo plano no tiene sentido seguir sondeando la base.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible"){ cargar(); reprogramar(); }
+  else clearInterval(timer);
+});
+
 cargar();
 reprogramar();
 
 // TODO Alex: grafico historico con /api/history/<node_id> (tarea 4.6, opcional).
+//            Devuelve {node_id, horas, puntos:[{timestamp, uso_pct, ...}]} y
+//            `puntos` puede venir vacio: hay que dibujar "sin datos", no fallar.
 </script>
 </body>
 </html>
