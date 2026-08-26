@@ -2,34 +2,45 @@
 Nodo Central de Monitoreo — modulo M2.  Responsable: Edwin.
 
     python -m servidor.main
+    python -m servidor.probar_concurrencia   # prueba de 9 nodos + watchdog
+    python -m servidor.probar_alta_automatica  # M2.2 / requisito 7.2 en caliente
+    python -m servidor.probar_watchdog         # M2.3 / estado No Reporta
+    python -m servidor.probar_mensajeria       # M2.4 / CMD + ACK + broadcast
+    python -m servidor.probar_consolidados     # M2.5 / totales cluster + growth
+    python -m servidor.probar_m26              # M2.6 / 9 nodos 10 min + 2 caidas
+    python -m servidor.consolidados            # reporte consolidados + N/A
+    python -m servidor.mensajeria --help       # encolar desde terminal (demo)
 
-ESQUELETO: la estructura, los hilos, el manejo de errores y la base ya estan
-resueltos. Lo que falta esta marcado con  # TODO Edwin.
+Tareas 2.1–2.6:
+    2.1  accept loop multicliente, un hilo por conexion
+    2.2  registro automatico al recibir HELLO (requisito 7.2)
+    2.3  watchdog con umbral por nodo (factor x intervalo_seg)
+    2.4  despachador de mensajes PENDIENTE hacia los sockets
+    2.5  consolidados del cluster (v_cluster + crecimiento; ver consolidados.py)
+    2.6  prueba de concurrencia en probar_m26.py (10 min, 2 caidas cronometradas)
 
 Hilos que levanta este proceso:
-    1. principal      -> accept() en bucle, un hilo nuevo por cliente
-    2. atender_cliente-> uno por conexion; recibe METRIC y ACK
-    3. watchdog       -> marca NO_REPORTA y RECUPERADO
-    4. despachador    -> lee mensajes PENDIENTE de la BD y los envia
+    1. principal       -> accept() en bucle, un hilo nuevo por cliente
+    2. atender_cliente -> uno por conexion; recibe HELLO, METRIC y ACK
+    3. watchdog        -> marca NO_REPORTA y RECUPERADO
+    4. despachador     -> lee mensajes PENDIENTE de la BD y los envia
 
-CONCURRENCIA — dos candados distintos, y hay que saber explicar la diferencia:
+CONCURRENCIA — dos candados distintos (DEFENSA: buscar comentarios # DEFENSA:):
 
-  CANDADO        protege el diccionario CONECTADOS. Es UNO para todo el
-                 servidor, y solo se toma para leer o escribir el diccionario:
-                 nunca mientras se habla con la red o con la base.
+  CANDADO            protege el diccionario CONECTADOS. Es UNO para todo el
+                     servidor, y solo se toma para leer o escribir el
+                     diccionario: nunca mientras se habla con la red o con
+                     la base.
 
-  candado del    protege UN socket. Es uno POR CONEXION. Dos hilos pueden
-  socket         escribir en el mismo socket (el despachador manda un CMD
-                 mientras el hilo del cliente manda METRIC_OK) y sin candado
-                 sus bytes se intercalan: el cliente recibe una linea corrupta
-                 y el mensaje se pierde en silencio.
-
-Si en la defensa preguntan por condiciones de carrera, estas dos lineas son la
-respuesta, y conviene senalarlas en el codigo.
+  candado_envio      protege UN socket. Es uno POR CONEXION (en atender_cliente).
+                     Dos hilos pueden escribir en el mismo socket (el despachador
+                     manda un CMD mientras el hilo del cliente manda METRIC_OK)
+                     y sin candado sus bytes se intercalan.
 """
 from __future__ import annotations
 
 import logging
+import signal
 import socket
 import threading
 
@@ -47,14 +58,51 @@ log = logging.getLogger("servidor")
 # --- ESTADO COMPARTIDO ENTRE HILOS ---------------------------------------
 # node_id -> (socket, candado de escritura de ese socket)
 CONECTADOS: dict[str, tuple[socket.socket, threading.Lock]] = {}
-CANDADO = threading.Lock()
+CANDADO = threading.Lock()          # DEFENSA: protege SOLO el dict CONECTADOS
 APAGANDO = threading.Event()
+_servidor_sock: socket.socket | None = None
 
 
-def _registrar_conectado(node_id: str, sock: socket.socket,
-                         candado: threading.Lock) -> None:
-    with CANDADO:
+def _cerrar_socket(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _intentar_registrar_conectado(node_id: str, sock: socket.socket,
+                                  candado: threading.Lock) -> bool:
+    """
+    Comprueba cupo y registra la conexion en UNA sola seccion critica.
+
+    DEFENSA: el lock cubre lectura de len(CONECTADOS) Y escritura del dict;
+    sin eso, dos hilos que aceptan el cliente 9 y 10 a la vez podrian pasar
+    ambos el chequeo de "lleno" antes de que cualquiera escriba.
+
+    Devuelve False si el cluster esta lleno y este node_id no estaba ya dentro.
+    """
+    viejo: socket.socket | None = None
+    with CANDADO:                       # DEFENSA: lock sobre estado compartido
+        if len(CONECTADOS) >= config.MAX_NODOS and node_id not in CONECTADOS:
+            return False
+        anterior = CONECTADOS.get(node_id)
+        if anterior is not None and anterior[0] is not sock:
+            viejo = anterior[0]
         CONECTADOS[node_id] = (sock, candado)
+    if viejo is not None:
+        log.info("Reconexion de %s: cierro el socket anterior", node_id)
+        _cerrar_socket(viejo)
+    return True
+
+
+def _cantidad_conectados() -> int:
+    """Lectura del estado compartido; siempre bajo CANDADO."""
+    with CANDADO:                       # DEFENSA: lock sobre estado compartido
+        return len(CONECTADOS)
 
 
 def _quitar_conectado(node_id: str, sock: socket.socket) -> int:
@@ -68,7 +116,7 @@ def _quitar_conectado(node_id: str, sock: socket.socket) -> int:
     nodo se marcan FALLIDO "no esta conectado" mientras el nodo reporta
     normalmente.
     """
-    with CANDADO:
+    with CANDADO:                       # DEFENSA: lock sobre estado compartido
         actual = CONECTADOS.get(node_id)
         if actual is not None and actual[0] is sock:
             del CONECTADOS[node_id]
@@ -80,7 +128,7 @@ def _quitar_conectado(node_id: str, sock: socket.socket) -> int:
 def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
     ip = direccion[0]
     node_id: str | None = None
-    candado_envio = threading.Lock()
+    candado_envio = threading.Lock()  # DEFENSA: lock por socket (escritura)
     log.info("Conexion entrante desde %s", ip)
 
     # Sin timeout, una conexion "medio abierta" (cable desenchufado, firewall
@@ -97,6 +145,10 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                 tipo = mensaje.get("tipo")
 
                 # ---------------------------------------------- HELLO
+                # M2.2 / requisito 7.2: alta automatica en caliente.
+                # Un node_id nuevo -> INSERT en nodos (ACTIVO) + evento
+                # ALTA_AUTOMATICA, sin reiniciar servidor ni editar config.
+                # El dashboard lo ve en el proximo refresh de /api/nodes.
                 if tipo == "HELLO":
                     if node_id is not None:
                         continue                # ya se presento; se ignora
@@ -106,56 +158,88 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                                          candado_envio)
                         return
 
-                    with CANDADO:
-                        lleno = (len(CONECTADOS) >= config.MAX_NODOS
-                                 and entrante not in CONECTADOS)
-                    if lleno:
+                    node_id = entrante
+                    if not _intentar_registrar_conectado(node_id, sock, candado_envio):
                         log.warning("Cluster lleno (%d), rechazo %s",
                                     config.MAX_NODOS, entrante)
-                        # Se le dice por que, en vez de cortar mudo: si no, el
-                        # cliente no distingue "lleno" de un fallo de red y
-                        # reintenta para siempre.
                         protocolo.enviar(
                             sock,
                             protocolo.error(f"Cluster lleno ({config.MAX_NODOS} nodos)"),
                             candado_envio)
                         return
 
-                    node_id = entrante
-                    _registrar_conectado(node_id, sock, candado_envio)
+                    try:
+                        es_nuevo, intervalo = repo.registrar_nodo(
+                            node_id=node_id,
+                            region=mensaje.get("region", "Desconocida"),
+                            hostname=mensaje.get("hostname"),
+                            so=mensaje.get("so"),
+                            ip=ip,
+                            intervalo=mensaje.get("intervalo", config.INTERVALO_DEFECTO_SEG),
+                        )
+                    except Exception as e:                            # noqa: BLE001
+                        # Si la base falla, hay que liberar el cupo en CONECTADOS
+                        # y avisar al cliente; si no, queda un fantasma ocupando plaza.
+                        _quitar_conectado(node_id, sock)
+                        node_id = None
+                        log.error("No se pudo registrar %s en la base: %s", entrante, e)
+                        protocolo.enviar(
+                            sock,
+                            protocolo.error("No se pudo completar el alta automatica"),
+                            candado_envio)
+                        return
 
-                    es_nuevo, intervalo = repo.registrar_nodo(
-                        node_id=node_id,
-                        region=mensaje.get("region", "Desconocida"),
-                        hostname=mensaje.get("hostname"),
-                        so=mensaje.get("so"),
-                        ip=ip,
-                        intervalo=mensaje.get("intervalo", config.INTERVALO_DEFECTO_SEG),
-                    )
                     sock.settimeout(config.FACTOR_TIMEOUT * intervalo)
                     protocolo.enviar(sock, protocolo.hello_ok(True, es_nuevo, intervalo),
                                      candado_envio)
-                    log.info("%s %s (%s) intervalo=%ss",
-                             "ALTA AUTOMATICA de" if es_nuevo else "Reconecta",
-                             node_id, mensaje.get("region"), intervalo)
+                    if es_nuevo:
+                        log.info(
+                            "*** ALTA AUTOMATICA (7.2): %s (%s) — aparece solo en "
+                            "dashboard, evento ALTA_AUTOMATICA, estado ACTIVO ***",
+                            node_id, mensaje.get("region"))
+                    else:
+                        log.info("Reconecta %s (%s) intervalo=%ss (conectados=%d)",
+                                 node_id, mensaje.get("region"), intervalo,
+                                 _cantidad_conectados())
+                    threading.current_thread().name = f"cliente-{node_id}"
 
                 # ---------------------------------------------- METRIC
                 elif tipo == "METRIC":
                     if node_id is None:
                         continue                # METRIC antes de HELLO: se ignora
+                    # La sesion manda: el node_id del JSON no puede sobreescribir
+                    # la identidad fijada en el HELLO (evita mezclar datos).
+                    metric_node = mensaje.get("node_id")
+                    if metric_node and metric_node != node_id:
+                        log.warning("METRIC con node_id ajeno (%s != %s); se ignora",
+                                    metric_node, node_id)
+                        continue
                     disco = mensaje.get("disco")
                     if not isinstance(disco, dict):
                         log.warning("METRIC de %s sin bloque 'disco'", node_id)
                         continue
-                    repo.guardar_metrica(node_id, mensaje.get("timestamp", ""), disco)
+                    repo.guardar_metrica(
+                        node_id, mensaje.get("timestamp", ""), disco)
+                    # M2.5: cada METRIC alimenta metricas -> v_cluster y growth
                     protocolo.enviar(sock, protocolo.metric_ok(), candado_envio)
 
                 # ---------------------------------------------- ACK
                 elif tipo == "ACK":
+                    if node_id is None:
+                        continue
                     cmd_id = mensaje.get("cmd_id")
+                    ack_nodo = mensaje.get("node_id")
+                    if ack_nodo and ack_nodo != node_id:
+                        log.warning("ACK de %s con node_id distinto (%s); se ignora",
+                                    node_id, ack_nodo)
+                        continue
                     if cmd_id:
                         repo.confirmar_ack(cmd_id)
-                        log.info("ACK de %s para %s", node_id, cmd_id)
+                        log.info(
+                            "ACK (M2.4) de %s cmd_id=%s — emparejado en "
+                            "mensajes.ack_en",
+                            node_id, cmd_id,
+                        )
 
             except Exception as e:                                # noqa: BLE001
                 # Un mensaje malo (un campo raro, un fallo puntual de la base)
@@ -201,22 +285,43 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
 
 def watchdog() -> None:
     """
-    Tarea 2.3. El umbral es por nodo: factor x su propio intervalo.
+    M2.3 / tarea 2.3 — vigilancia de nodos caidos (estado NO REPORTA).
 
-    Este hilo es el UNICO que cambia `nodos.estado`, en los dos sentidos. Tener
-    un solo escritor del estado evita que el hilo del cliente y el watchdog se
-    pisen y el nodo quede oscilando entre ACTIVO y NO_REPORTA.
+    Un cable desconectado no manda despedida: este hilo revisa cada
+    PERIODO_WATCHDOG_SEG segundos si ultimo_reporte supero el umbral:
+
+        umbral = FACTOR_TIMEOUT x intervalo_seg del nodo  (default: 3 x intervalo)
+
+    Si paso -> marca NO_REPORTA + evento en tabla eventos.
+    Si el nodo vuelve a reportar -> ACTIVO + evento RECUPERADO (failover).
+
+    Este hilo es el UNICO que escribe nodos.estado. Ni atender_cliente ni
+    registrar_nodo tocan el estado: asi cada transicion queda en eventos.
     """
-    log.info("Watchdog activo (factor=%dx el intervalo de cada nodo)",
-             config.FACTOR_TIMEOUT)
+    factor = config.FACTOR_TIMEOUT
+    periodo = config.PERIODO_WATCHDOG_SEG
+    log.info(
+        "Watchdog activo (M2.3): cada %ds, umbral = %dx intervalo_seg de cada nodo",
+        periodo, factor,
+    )
     try:
-        while not APAGANDO.wait(config.PERIODO_WATCHDOG_SEG):
+        while not APAGANDO.wait(periodo):
             try:
-                for node_id in repo.marcar_nodos_caidos(config.FACTOR_TIMEOUT):
-                    log.warning("NO REPORTA: %s", node_id)
-                for node_id in repo.marcar_nodos_recuperados(config.FACTOR_TIMEOUT):
-                    log.info("RECUPERADO: %s", node_id)
+                for node_id in repo.marcar_nodos_caidos(factor):
+                    log.warning(
+                        "*** NO REPORTA (M2.3): %s — sin reportes dentro de "
+                        "%dx su intervalo; evento NO_REPORTA en bitacora ***",
+                        node_id, factor,
+                    )
+                for node_id in repo.marcar_nodos_recuperados(factor):
+                    log.info(
+                        "*** RECUPERADO (M2.3): %s — volvio a reportar; "
+                        "ACTIVO + evento RECUPERADO (failover) ***",
+                        node_id,
+                    )
             except Exception as e:                                # noqa: BLE001
+                # Un ciclo fallido no puede matar el watchdog: los otros nodos
+                # siguen dependiendo de el para detectar caidas.
                 log.error("Error en watchdog: %s", e)
     finally:
         cerrar_conexion_del_hilo()
@@ -224,19 +329,48 @@ def watchdog() -> None:
 
 # ================================================================ despachador
 
+def _despachar_un_mensaje(m: dict) -> None:
+    """
+    M2.4 — envia un CMD a un nodo concreto.
+
+    Flujo:
+      1. Buscar socket en CONECTADOS (bajo CANDADO, sin I/O)
+      2. marcar_enviado(cmd_id)  -> enviado_en en BD
+      3. protocolo.cmd(..., cmd_id) por el socket
+      4. El cliente responde ACK(cmd_id) -> confirmar_ack -> ack_en en BD
+    """
+    cmd_id = m["cmd_id"]
+    node_id = m["node_id"]
+    with CANDADO:                       # DEFENSA: lookup rapido en CONECTADOS
+        destino = CONECTADOS.get(node_id)
+    if destino is None:
+        repo.marcar_fallido(cmd_id, "El nodo no esta conectado")
+        log.warning("M2.4: no se envio a %s (desconectado) cmd_id=%s",
+                    node_id, cmd_id)
+        return
+
+    sock, candado_envio = destino
+    repo.marcar_enviado(cmd_id)
+    protocolo.enviar(sock, protocolo.cmd(
+        cmd_id, m["accion"], m.get("texto"), m.get("valor")),
+        candado_envio)
+    texto = m.get("texto") or m["accion"]
+    log.info("M2.4 -> %s cmd_id=%s : %s", node_id, cmd_id, texto)
+
+
 def despachador() -> None:
     """
-    Puente entre la API y los sockets. Lee los mensajes que el dashboard dejo
-    en estado PENDIENTE y los envia al nodo si esta conectado.
+    M2.4 / requisito 7.1 — mensajeria del servidor hacia los clientes.
 
-    Se marca ENVIADO ANTES de mandarlo. Parece al reves, pero es a proposito:
-    si el proceso muere entre el envio y la marca, el mensaje se reenviaria al
-    arrancar de nuevo y el nodo lo recibiria dos veces. Marcando antes, un
-    fallo produce una perdida (visible: se queda en ENVIADO sin ACK) en vez de
-    un duplicado silencioso. Para mensajes de operacion, perder es mejor que
-    duplicar.
+    Puente API/dashboard -> sockets. Lee mensajes PENDIENTE de la BD y los
+    manda como CMD (cada uno con cmd_id unico para emparejar el ACK).
+
+    Unicast: una fila por node_id. Broadcast: N filas (una por nodo), cada
+    una con su cmd_id; este hilo las despacha igual, una por ciclo.
+
+    Se marca ENVIADO ANTES de mandarlo (ver docs/CAMBIOS.md).
     """
-    log.info("Despachador activo (cada %ds)", config.PERIODO_DESPACHADOR_SEG)
+    log.info("Despachador activo (M2.4, cada %ds)", config.PERIODO_DESPACHADOR_SEG)
     try:
         while not APAGANDO.wait(config.PERIODO_DESPACHADOR_SEG):
             try:
@@ -249,20 +383,7 @@ def despachador() -> None:
                 # try/except POR MENSAJE: un nodo con problemas no puede
                 # bloquear los mensajes de los otros ocho.
                 try:
-                    with CANDADO:
-                        destino = CONECTADOS.get(m["node_id"])
-                    if destino is None:
-                        repo.marcar_fallido(m["cmd_id"], "El nodo no esta conectado")
-                        log.warning("No se pudo enviar a %s: no esta conectado",
-                                    m["node_id"])
-                        continue
-
-                    sock, candado_envio = destino
-                    repo.marcar_enviado(m["cmd_id"])
-                    protocolo.enviar(sock, protocolo.cmd(
-                        m["cmd_id"], m["accion"], m.get("texto"), m.get("valor")),
-                        candado_envio)
-                    log.info("-> %s : %s", m["node_id"], m.get("texto") or m["accion"])
+                    _despachar_un_mensaje(m)
                 except OSError as e:
                     try:
                         repo.marcar_fallido(m["cmd_id"], f"Error de red: {e}")
@@ -278,30 +399,42 @@ def despachador() -> None:
 # ======================================================================= main
 
 def _cerrar_todas_las_conexiones() -> None:
-    with CANDADO:
+    with CANDADO:                       # DEFENSA: lock sobre estado compartido
         sockets = [s for s, _ in CONECTADOS.values()]
         CONECTADOS.clear()
     for s in sockets:
+        _cerrar_socket(s)
+
+
+def _pedir_apagado(signum: int, _frame: object) -> None:
+    """SIGINT/SIGTERM desbloquean accept() via APAGANDO + timeout del socket."""
+    log.info("Senal %s recibida; apagando servidor...", signum)
+    APAGANDO.set()
+    global _servidor_sock
+    if _servidor_sock is not None:
         try:
-            s.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            s.close()
+            _servidor_sock.close()
         except OSError:
             pass
 
 
 def main() -> None:
+    global _servidor_sock
     config.asegurar_directorios()
     if not probar_conexion():
         log.error("Sin MySQL no arranca. Revisen el .env y que el servicio este arriba.")
         return
 
+    signal.signal(signal.SIGINT, _pedir_apagado)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _pedir_apagado)
+
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _servidor_sock = servidor
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     servidor.bind((config.SOCKET_HOST, config.SOCKET_PORT))
     servidor.listen(config.MAX_NODOS + 5)
+    servidor.settimeout(1.0)            # permite revisar APAGANDO entre accepts
     log.info("Escuchando en %s:%d (max %d nodos)",
              config.SOCKET_HOST, config.SOCKET_PORT, config.MAX_NODOS)
 
@@ -315,8 +448,18 @@ def main() -> None:
         h.start()
 
     try:
+        # Hilo principal: bind + listen + accept. Por cada TCP aceptado lanza
+        # UN hilo daemon que solo atiende a ese cliente; el principal sigue
+        # en accept() y no toca sockets de clientes ajenos.
         while not APAGANDO.is_set():
-            sock, direccion = servidor.accept()
+            try:
+                sock, direccion = servidor.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if APAGANDO.is_set():
+                    break
+                raise
             threading.Thread(
                 target=atender_cliente,
                 args=(sock, direccion),
@@ -331,6 +474,7 @@ def main() -> None:
             servidor.close()
         except OSError:
             pass
+        _servidor_sock = None
         # Cerrar los sockets desbloquea a los hilos de cliente, que asi corren
         # su finally y devuelven su conexion a MySQL.
         _cerrar_todas_las_conexiones()

@@ -1,0 +1,250 @@
+PRÁCTICA 1  ·  SISTEMAS DISTRIBUIDOS
+Storage Cluster CNS
+Documento de trabajo del equipo
+Implementación de un Storage Cluster con Nodo Central de Monitoreo para las 9 administraciones regionales de la Caja Nacional de Salud. Comunicación mediante sockets TCP/IP bidireccionales, persistencia en base de datos y dashboard de visualización centralizada.
+Stack: Python 3.12 (socket + threading)  ·  MySQL 8.0  ·  FastAPI  ·  HTML/JS
+Equipo: 5 integrantes  ·  5 módulos  ·  1 carpeta por persona
+Lean esto antes de escribir la primera línea de código.
+ 
+1. Qué estamos construyendo
+Cada una de las 9 regionales de la CNS tiene un servidor de archivos con historiales clínicos digitales. Nosotros construimos el sistema que los monitorea desde un punto central: cada regional corre un agente que mide su disco y lo reporta por socket TCP; un nodo central recibe los 9 reportes de forma concurrente, los guarda, calcula los totales del cluster, detecta quién dejó de reportar y puede mandarle mensajes de vuelta a cualquier nodo.
+Son tres procesos separados corriendo a la vez, más los clientes:
+•	Servidor de sockets — escucha en el puerto 5050, un hilo por cliente, escribe en la base.
+•	API FastAPI — lee la base y la expone por HTTP en el puerto 8000.
+•	Dashboard — página web que consume la API y se refresca sola.
+•	9 clientes — uno por regional. Dos tienen que correr en máquinas reales distintas, una Windows y una Linux.
+La parte que casi nadie ve venir
+El servidor de sockets y la API son procesos distintos: no comparten memoria. Cuando alguien manda un mensaje desde el dashboard, la API no le habla al servidor de sockets directamente. Inserta una fila en la tabla mensajes con estado PENDIENTE, y el despachador del servidor la recoge en menos de un segundo, la envía por el socket y la marca ENVIADO. Cuando el cliente responde, queda CONFIRMADO.
+La base de datos es el bus del sistema.  Esto es una decisión de arquitectura, no un accidente. Nos deja reiniciar cada proceso por separado y deja auditados todos los mensajes aunque el nodo esté caído. Cuesta hasta un segundo de latencia, que para monitoreo es irrelevante. Es la primera pregunta que van a hacer en la defensa: los cinco tienen que poder contestarla igual.
+2. Decisiones ya tomadas
+Estas no se rediscuten a mitad de semana. Están tomadas y el código base ya las implementa.
+
+Decisión	Qué elegimos	Por qué
+Lenguaje	Python 3.12	sockets y threading en la librería estándar; psutil resuelve las métricas de disco en Windows y Linux con el mismo código.
+Concurrencia	Un hilo por cliente + lock	Es lo que pide el enunciado y lo más fácil de explicar en la defensa. 9 clientes no justifican async.
+Base de datos	MySQL 8.0	Necesitamos funciones de ventana (ROW_NUMBER, FIRST_VALUE) para la última métrica de cada nodo y el growth rate.
+API	FastAPI + uvicorn	Documentación automática en /docs y validación con Pydantic: menos código que escribir y que defender.
+Formato de mensaje	JSON, uno por línea	TCP es un flujo de bytes y no respeta los límites de los mensajes. El salto de línea es el separador.
+Bus API ↔ sockets	Tabla mensajes	Los dos procesos no comparten memoria. La base los conecta y de paso audita todo.
+ 
+3. Los cinco roles
+Cada persona es dueña de una carpeta y de un módulo. La regla base es simple: nadie edita la carpeta de otro. Si necesitás algo de ahí, lo pedís en el grupo. Eso solo elimina la mayoría de los conflictos de merge y las discusiones de “yo pensé que lo hacías vos”.
+
+Rol	Persona	Carpetas que edita	Tareas	Horas
+Datos y Coordinación	Robert	comun/  db/  api/  docs/	0.1–0.5, 3.1–3.3, 4.1, 6.1	~17 h
+Nodo Cliente	Martin	cliente/	1.1–1.6	~10.5 h
+Servidor Central	Edwin	servidor/	2.1–2.6	~12.5 h
+Dashboard	Alex	dashboard/	4.2–4.6	~10 h
+Integración y Demo	Alexandro	scripts/  presentación	5.1–5.4, 6.2–6.4	~11 h
+Compartidas	los 5	—	6.5, 6.6	~3.5 h c/u
+Rol 1 · Datos y Coordinación — Robert
+Dueño de: comun/  db/  api/  docs/
+Arranca el proyecto y sostiene el centro. Los dos primeros días define el contrato del protocolo y levanta el repositorio; después construye toda la capa de datos y la API que consume el dashboard. Al final escribe el microinforme obligatorio.
+Es el rol que bloquea a los demás, por eso va primero en el cronograma: hasta que el protocolo no esté cerrado, nadie puede escribir cliente ni servidor sin riesgo de tener que rehacerlo.
+•	Módulo 0 — roles y mandamientos, repositorio Git, contrato del protocolo, entorno, esqueleto del proyecto.
+•	Base de datos — esquema MySQL, pool de conexiones, todas las consultas, prueba de concurrencia, diagrama ER.
+•	API — los 9 endpoints de FastAPI sobre la base.
+•	Documentación — microinforme de la sección 9 del enunciado.
+Rol 2 · Nodo Cliente — Martin
+Dueño de: cliente/
+El agente que corre en cada regional. Lee el primer disco del sistema, se conecta al nodo central, reporta cada N segundos y en paralelo escucha lo que el central le manda, lo escribe en un archivo .log y responde con un ACK.
+Necesita las dos máquinas desde el día 2: es el único rol que tiene que probar en Windows y en Linux, y eso vale 10% de la nota por sí solo. Si consigue las máquinas el día de la entrega, ese 10% se pierde.
+•	Métricas del disco con psutil: nombre, tipo SSD/HDD, capacidad, usado, libre, IOPS y latencia.
+•	Socket cliente con reconexión automática y espera creciente.
+•	Segundo hilo receptor, archivo de log y confirmación ACK (requisito 7.1).
+•	Intervalo configurable por archivo y por comando del servidor, en caliente (requisito 7.3).
+•	Script que levanta los 9 nodos regionales en una sola máquina.
+Rol 3 · Servidor Central — Edwin
+Dueño de: servidor/
+El módulo más pesado y el que más pesa en la rúbrica. Acepta conexiones en bucle y lanza un hilo por cliente; un segundo hilo vigila quién dejó de reportar; un tercero despacha los mensajes que el dashboard dejó pendientes en la base.
+En la defensa le van a preguntar dónde está el lock y qué protege. Tiene que poder señalar la línea exacta.
+•	Socket servidor multicliente con hilos y lock sobre el estado compartido.
+•	Registro automático de un cliente nuevo, sin reiniciar nada (requisito 7.2, vale 10%).
+•	Watchdog que marca “No Reporta” con umbral por nodo.
+•	Mensajería hacia los clientes y registro del ACK.
+•	Cálculo de los consolidados del cluster.
+•	Prueba de concurrencia con los 9 nodos y medición del tiempo de detección de caída.
+Rol 4 · Dashboard — Alex
+Dueño de: dashboard/
+Lo único que el tribunal mira durante casi toda la defensa. Consume la API por HTTP; no toca la base ni los sockets, así que puede empezar el día 3 sin esperar a que nada más funcione.
+Que se entienda desde el fondo del aula, no de cerca: estado por color además de por texto, y el porcentaje de utilización global más grande que todo lo demás.
+•	Tabla de los 9 servidores con capacidad, libre, porcentaje y estado.
+•	Panel de totales y KPIs del cluster.
+•	Auto-refresh parametrizable desde la interfaz (requisito explícito).
+•	Envío de mensajes a un nodo y visualización del ACK cuando vuelve.
+•	Gráfico histórico de utilización (opcional, es lo primero que se recorta si falta tiempo).
+Rol 5 · Integración, Demo y Presentación — Alexander
+Dueño de: scripts/  y de la presentación
+Los primeros días trabaja poco y a partir del día 5 se vuelve el más importante. Es quien hace que las piezas de los otros cuatro funcionen juntas en red real, y quien prepara la demo para que no dependa de la suerte.
+El enunciado valida la práctica solo con ejecución en vivo, dos clientes reales y red local. Ese día aparecen los problemas que no existen en desarrollo: firewall de Windows, el servidor escuchando en 127.0.0.1 en vez de 0.0.0.0, IPs que cambiaron por DHCP.
+•	Integración end-to-end en LAN con dos máquinas físicas distintas.
+•	Pruebas de fallo: matar el servidor, desconectar un cliente, agregar un nodo en caliente.
+•	Runbook y script de arranque de la demo.
+•	Video de respaldo y capturas.
+•	Diagramas de arquitectura y secuencia, presentación de 10 a 12 diapositivas, conclusiones.
+Sobre el reparto de horas:  el rol 1 tiene la carga más alta (~17 h) porque concentra el arranque, la base de datos y la API. Es a propósito: son las tareas que bloquean a los demás y conviene que las haga una sola persona. Si sobre el día 6 la cuenta no cierra, lo primero que se delega es la redacción de las conclusiones al rol 5.
+ 
+4. Quién edita qué
+Esta tabla es la que evita los conflictos. Si tu nombre no está en la fila, no tocás ese archivo.
+
+Carpeta / archivo	Dueño	Qué contiene
+comun/protocolo.py	Robert	Los mensajes JSON y el lector que resuelve el framing. CONTRATO: se cambia solo avisando al grupo.
+comun/config.py	Robert	Toda la configuración, leída del .env. Nadie lee variables de entorno por su cuenta.
+db/	Robert	Esquema, pool de conexiones, todas las consultas. Nadie escribe SQL fuera de aquí.
+api/	Robert	FastAPI y modelos Pydantic.
+cliente/	Martin	Métricas de disco, socket cliente, hilo receptor, logs.
+servidor/	Edwin	Accept loop, watchdog, despachador.
+dashboard/	Alex	La página web completa: HTML, CSS y JS en un solo archivo.
+scripts/	Alexander	Lanzador de los 9 nodos y script de arranque de la demo.
+docs/	Robert y Alexander	protocolo.md lo mantiene Robert; los diagramas, Alexander.
+.env	cada uno	Local a cada máquina. NO se sube al repositorio.
+Las siete reglas
+1.	comun/protocolo.py y comun/config.py son de Robert. Si necesitás un campo nuevo, lo pedís en el grupo; no lo agregás por tu cuenta.
+2.	Nadie escribe SQL fuera de db/repositorio.py. Si te falta una consulta, se la pedís a Robert.
+3.	Nadie llama a mysql.connector.connect(). Siempre  with cursor() as cur,  que usa el pool.
+4.	Nadie arma un JSON a mano. Se usan las funciones de protocolo.py.
+5.	Rama por tarea, merge a dev. main solo recibe código que arranca.
+6.	El .env nunca se commitea, y la contraseña de Aiven no se escribe en ningún archivo del repositorio. El db/ca.pem sí va: es un certificado público, no una credencial.
+7.	Si no corre en LAN entre dos máquinas, no está hecho. Localhost no cuenta.
+ 
+5. Estructura del repositorio
+Está en el repositorio. Las carpetas comun/, db/ y api/ vienen terminadas; cliente/, servidor/ y dashboard/ vienen como esqueleto funcional con los TODO marcados con el rol responsable.
+storage-cluster-cns/
+├── comun/            CONTRATOS · Robert · no se tocan sin avisar
+│   ├── config.py         toda la config, leída del .env
+│   └── protocolo.py      mensajes JSON + framing por línea
+├── db/               Robert · COMPLETO Y CARGADO EN AIVEN
+│   ├── schema.sql        4 tablas + 3 vistas (Aiven y local)
+│   ├── schema_local.sql  crear base y usuario, solo local
+│   ├── ca.pem            certificado de Aiven (publico)
+│   ├── probar_aiven.py   verifica DNS, puerto, TLS y esquema
+│   ├── conexion.py       pool de conexiones con TLS
+│   ├── repositorio.py    TODO el SQL del proyecto
+│   └── probar_bd.py      prueba de concurrencia y agregaciones
+├── api/              Robert · COMPLETO
+│   ├── main.py           FastAPI, 9 endpoints
+│   └── modelos.py        Pydantic
+├── cliente/          Martin · esqueleto
+│   ├── main.py           2 hilos, reconexión, ACK
+│   ├── metricas.py       psutil, SSD/HDD, IOPS por delta
+│   └── config.json
+├── servidor/         Edwin · esqueleto
+│   └── main.py           accept loop + watchdog + despachador
+├── dashboard/        Alex · esqueleto funcional
+│   └── index.html        tabla + KPIs + auto-refresh
+├── scripts/          Alexander
+│   ├── lanzar_nodos.py   levanta los 9
+│   └── start_demo.sh     runbook de la demo
+├── docs/protocolo.md
+├── requirements.txt · .env.example · .gitignore · README.md
+└── logs/             cliente_<node_id>.log  (requisito 7.1)
+Puesta en marcha, seis comandos
+git clone https://github.com/Robert1532/Storage-Cluster-con-Nodo-Central && cd storage-cluster-cns
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # editar credenciales
+mysql -u root -p < db/schema.sql
+python -m db.probar_bd        # tiene que pasar TODO antes de seguir
+Para levantar todo junto:
+./scripts/start_demo.sh 192.168.1.100
+ 
+6. La base de datos: ya está lista
+Esta parte está terminada. El esquema está cargado en una instancia de MySQL 8 hosteada en Aiven, y las cuatro tablas y las tres vistas ya existen. Nadie tiene que instalar MySQL para empezar a trabajar: se clona el repositorio, se pega la contraseña en el .env y se programa.
+Datos de conexión
+Ya están en el archivo .env.example del repositorio. Lo único que falta es la contraseña, que Robert pasa por el grupo — no está en GitHub y no va a estar.
+DB_HOST=storagecluster-robertdenilo2005-eebb.a.aivencloud.com
+DB_PORT=20229                # Aiven NO usa el 3306
+DB_USER=avnadmin
+DB_PASSWORD=<la pasa Robert por el grupo>
+DB_NAME=defaultdb            # la base ya viene creada, se llama asi
+DB_SSL_CA=db/ca.pem          # sin esto la conexion es rechazada
+DB_POOL_SIZE=10
+El certificado db/ca.pem sí está en el repositorio y no hace falta descargarlo: es un certificado público que Aiven publica en su panel, no una credencial. Lo que nunca se sube es la contraseña.
+Cómo saber en 10 segundos si tenés todo bien
+Antes de escribir una línea de tu módulo, corré esto. Verifica en orden las cuatro cosas que pueden fallar, y si algo falla te dice exactamente cuál y qué hacer.
+python -m db.probar_aiven
+
+  [1/4] Resolviendo el nombre del host...      OK
+  [2/4] Abriendo el puerto 20229...            OK  (84 ms)
+  [3/4] Autenticando (TLS + usuario)...        OK  MySQL 8.0.x
+  [4/4] Buscando las tablas y las vistas...    OK
+Si el paso 2 falla, la red desde donde estás conectando bloquea el puerto de salida. Probalo compartiendo datos del celular para descartar; muchas redes de universidad bloquean puertos altos.
+Tres cosas que hay que tener en cuenta
+Las conexiones alcanzan, pero con margen justo
+Aiven calcula el límite como 75 × GB de RAM + 1, así que el plan gratuito de 1 GB da alrededor de 76 conexiones simultáneas. Nosotros corremos dos procesos —servidor de sockets y API— y cada uno arma su propio pool, o sea el doble de lo que diga DB_POOL_SIZE. Con 10 son 20 conexiones y sobra margen para MySQL Workbench y para lo que abran ustedes a mano. No lo suban sin motivo.
+El espacio no es problema
+El plan gratuito da 1 GB de almacenamiento. Nueve nodos reportando cada 10 segundos generan unas 78.000 filas por día, que son unos 12 MB diarios contando índices. En una semana no llegamos ni a 100 MB.
+Todo pasa por internet, y eso tiene consecuencias
+Cada INSERT es un viaje de ida y vuelta a la nube, no un acceso a disco local. Con nueve nodos reportando cada diez segundos es menos de un INSERT por segundo, así que no se va a notar. Pero si alguien baja el intervalo a un segundo para probar, la latencia sí se empieza a ver.
+Y este es el riesgo real de la demo.  Aiven apaga los servicios gratuitos tras un período sin uso, avisando por correo antes. Si el fin de semana previo a la defensa nadie toca la base, existe la posibilidad concreta de llegar el viernes con el servicio apagado. A eso hay que sumarle que si el aula no tiene internet, o la red del laboratorio bloquea el puerto de salida, Aiven simplemente no existe y no hay demo — y el enunciado exige ejecución en vivo.
+Por eso: Aiven para desarrollar, MySQL local para la demo
+Usamos los dos, y está previsto en el código: el .env trae las dos configuraciones y se cambia de una a otra comentando cinco líneas, sin tocar una sola línea de Python.
+•	Días 1 a 5 — Aiven. Los cinco contra la misma base, sin instalar nada. El dashboard de Alex ve los nodos de Martin aunque no estén en la misma red.
+•	Día 6 — MySQL local en la máquina que hará de servidor. Se corre schema_local.sql y después schema.sql, se corre probar_bd.py, y se ensaya la demo completa contra esa base.
+•	Día 7 y defensa — local, con Aiven como respaldo. Si el aula tiene internet, mostrar que también funciona contra la nube suma; si no lo tiene, no se nota.
+Hay un segundo motivo, menos técnico: el enunciado dice que la solución opera en LAN. El cluster —clientes y servidor— efectivamente está en LAN, y solo la persistencia sale a internet. Es defendible, pero conviene tener la respuesta preparada y, sobre todo, poder demostrarlo funcionando sin depender de la nube.
+ 
+7. El repositorio en GitHub
+Robert sube el código base y les pasa el link. A partir de ahí cada uno clona y trabaja en su carpeta.
+Primer clonado — esto hace cada uno una sola vez
+git clone https://github.com/Robert1532/Storage-Cluster-con-Nodo-Central.git && cd storage-cluster-cns
+
+python3.12 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env             # y pegar la clave que paso Robert
+python -m db.probar_aiven        # tiene que dar OK en los 4 pasos
+Cómo trabajar sin pisarse
+•	Una rama por tarea, con el número de la tarea en el nombre: git checkout -b tarea-1.3-socket-cliente
+•	Se mergea a dev, nunca directo a main. main solo recibe código que arranca.
+•	Commit diario, aunque sea chico. El historial de Git se evalúa y un repo donde solo commitea uno se nota a simple vista.
+•	Antes de empezar el día: git pull origin dev. Antes de pedir merge: volver a hacerlo.
+Qué nunca se sube
+Todo esto ya está en el .gitignore, pero conviene que lo sepan por qué:
+
+Archivo	¿Va al repo?	Por qué
+.env	NUNCA	Tiene la contraseña de la base. Si se sube, cualquiera que vea el repo entra a nuestros datos.
+db/ca.pem	Sí	Es un certificado público que Aiven publica en su panel. No es una credencial.
+.env.example	Sí	Es la plantilla, sin contraseña. Es lo que cada uno copia.
+logs/*.log	No	Se generan al correr. Ensucian el historial y provocan conflictos.
+.venv/  __pycache__/	No	Se regeneran solos en cada máquina.
+Sobre la contraseña de Aiven:  la contraseña actual del usuario avnadmin ya circuló fuera del panel de Aiven, así que conviene rotarla antes de compartirla con el equipo — en el panel, Service → Users → Reset password. Después se pasa la nueva por el grupo privado, y esa es la única vía: nunca por el repositorio, nunca dentro de un archivo commiteado, nunca en el informe ni en las diapositivas. Si alguna vez se sube por error, no alcanza con borrarla en el siguiente commit: queda en el historial y hay que rotarla igual.
+8. El modelo de datos
+Cuatro tablas, cada una responde a una pregunta distinta y a un requisito distinto del enunciado. No hay tablas de adorno.
+
+Tabla	Responde	Requisito que cubre	Detalle que importa
+nodos	Quién existe	Identificador del cliente, estado del nodo	node_id es UNIQUE: de eso depende el alta automática. primer_registro es la evidencia del 7.2.
+metricas	Qué reportaron	Historial de métricas, timestamp	Una fila por reporte, nunca UPDATE. Índice compuesto por (node_id, timestamp).
+eventos	Qué les pasó	Estado del nodo, tolerancia a fallos	De aquí salen los failover events y la disponibilidad.
+mensajes	Qué se les dijo	7.1 bidireccional, 7.3 intervalo	Además es el bus entre la API y los sockets. cmd_id empareja el ACK.
+
+Y tres vistas que sacan la lógica repetida del código Python:
+•	v_ultima_metrica — la última medición de cada nodo. Usa ROW_NUMBER() con partición por nodo, no ORDER BY … LIMIT 1, que devolvería una sola fila del cluster entero.
+•	v_nodos_estado — catálogo más última métrica más segundos sin reportar. Es lo que consume GET /api/nodes.
+•	v_cluster — una sola fila con todos los consolidados. Es lo que consume GET /api/cluster.
+9. Cronograma y cortes
+Los cutoffs no se mueven. Si no se llega, se recorta alcance; no se corre la fecha.
+
+Día	Foco	Quién trabaja	Corte
+D1	Arranque	Robert (los demás leen el protocolo)	CUTOFF: protocolo cerrado y escrito
+D2	Núcleo	Robert, Martin y Edwin	—
+D3	Bidireccional	Robert, Martin, Edwin y arranca Alex	CUTOFF: una métrica viaja y queda guardada
+D4	Cluster	Martin, Edwin y Alex	—
+D5	LAN real	Alexander con todos	CUTOFF: la demo corre fuera de localhost
+D6	Endurecer	Alexander, y Robert pasa a MySQL local	CUTOFF: probar_bd pasa contra la base de la demo
+D7	Entrega	Robert, Alex y Alexander, más ensayo de los 5	CONGELAR CÓDIGO
+10. Requisitos obligatorios y dónde viven
+Si alguno de estos falta, la práctica no se acepta, sin importar lo bien que funcione lo demás.
+
+Requisito	Rol	Dónde está implementado
+7.1 Bidireccional + log + ACK	Martin y Edwin	cliente/main.py::escuchar, servidor/main.py::despachador, tabla mensajes
+7.2 Alta automática de cliente	Robert y Edwin	db/repositorio.py::registrar_nodo, evento ALTA_AUTOMATICA
+7.3 Intervalo parametrizable	Martin y Alex	cliente/config.json, CMD SET_INTERVAL, POST /api/config/<node_id>
+Solo el primer disco	Martin	cliente/metricas.py::primer_disco
+Estado No Reporta	Edwin	servidor/main.py::watchdog + repositorio.marcar_nodos_caidos
+Exactamente 9 clientes	Edwin	MAX_NODOS en el .env, control en atender_cliente
+Cliente en Windows y Linux	Martin	Tarea 1.2 — se prueba, no se programa
+Ejecución en vivo en LAN	Alexander	Tareas 5.1 a 5.4
+
+Este documento se actualiza cuando cambie algo. Si algo de acá ya no es cierto, avisen en el grupo antes de programar en contra.
