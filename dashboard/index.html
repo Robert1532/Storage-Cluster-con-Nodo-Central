@@ -56,13 +56,73 @@
   button:disabled{opacity:.45;cursor:not-allowed}
   #eco{font-size:12px;color:var(--soft);margin-left:auto}
   #eco.error{color:var(--mal)}
+
+  header{align-items:center}
+  header{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+  header h1{margin-right:auto}
+  .header-refresh{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:11px;color:var(--soft)}
+  .header-refresh select{padding:5px 8px;font-size:12px}
+  .resumen{display:flex;gap:22px;font-size:12px;color:var(--soft)}
+  .resumen b{display:block;font-size:16px;color:var(--txt)}
+  .donut-wrap{position:relative;width:70px;height:70px}
+  .donut-txt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  .donut-txt b{font-size:14px}
+  .donut-txt span{font-size:9px;color:var(--soft)}
+
+  .tarjetas{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;margin-bottom:20px}
+  .tarjeta{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer;transition:border-color .15s}
+  .tarjeta:hover{border-color:var(--acc)}
+  .tarjeta.caida{opacity:.55}
+  .t-region{font-weight:700;text-align:center;margin-bottom:6px}
+  .t-datos{font-size:11.5px;color:var(--soft);line-height:1.5;margin-bottom:8px}
+  .t-pct{font-size:12px;margin:6px 0;text-align:center}
+  .t-reporte{font-size:10.5px;color:var(--soft);margin-top:6px;text-align:center}
+
+  .modal-fondo{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);align-items:center;justify-content:center;z-index:50}
+  .modal-fondo.visible{display:flex}
+  .modal-caja{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:20px;width:320px}
+  .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+  .modal-x{background:none;border:none;color:var(--soft);font-size:16px;cursor:pointer;padding:2px 6px}
+  .modal-campo{display:block;font-size:12px;color:var(--soft);margin-bottom:12px}
+  .modal-campo select{width:100%;margin-top:4px}
+  .modal-acciones{display:flex;align-items:center;gap:10px}
 </style>
 </head>
 <body>
 
 <header>
   <h1>Storage Cluster · Caja Nacional de Salud</h1>
-  <div class="ctrl">
+  <div class="resumen" id="resumen"></div>
+  <div class="header-refresh">
+    <select id="refresco">
+      <option value="2">2 s</option>
+      <option value="5" selected>5 s</option>
+      <option value="10">10 s</option>
+      <option value="30">30 s</option>
+    </select>
+    <span id="ultima">—</span>
+  </div>
+  <div class="donut-wrap">
+    <svg id="donut" viewBox="0 0 100 100" width="70" height="70"></svg>
+    <div class="donut-txt"><b id="donutPct">0%</b><span>Utilizado</span></div>
+  </div>
+</header>
+
+<main>
+  <div id="aviso"></div>
+
+  <div class="tarjetas" id="tarjetas"></div>
+
+  <div class="caja" id="historial-caja">
+    <strong style="font-size:13px">Histórico de utilización</strong>
+    <select id="nodoHistorial"></select>
+    <span id="historial-info" style="color:var(--soft);font-size:12px;margin-left:auto"></span>
+  </div>
+  <div class="tabla-wrap" style="margin-top:10px">
+    <svg id="grafico" viewBox="0 0 800 220" style="width:100%;height:220px;background:var(--card);border:1px solid var(--line);border-radius:6px"></svg>
+  </div>
+
+  <!--<div class="ctrl" style="margin-top:16px">
     <label>Auto-refresh
       <select id="refresco">
         <option value="2">2 s</option>
@@ -72,80 +132,94 @@
       </select>
     </label>
     <span id="ultima">—</span>
-  </div>
-</header>
-
-<main>
-  <div id="aviso"></div>
-  <div class="kpis" id="kpis"></div>
-  <div class="tabla-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Nodo</th><th>Regional</th><th>SO</th><th>Disco</th><th>Tipo</th>
-          <th>Capacidad</th><th>Usado</th><th>Libre</th><th>Utilización</th>
-          <th>Estado</th><th>Último reporte</th>
-        </tr>
-      </thead>
-      <tbody id="filas"></tbody>
-    </table>
-  </div>
-
-  <div class="caja">
-    <strong style="font-size:13px">Enviar mensaje a un nodo</strong>
-    <select id="destino"></select>
-    <select id="texto">
-      <option>Reinicie servicio</option>
-      <option>Verifique espacio en disco</option>
-      <option>Actualización de configuración</option>
-    </select>
-    <button id="enviar" disabled>Enviar</button>
-    <span id="eco"></span>
-  </div>
+  </div> -->
 </main>
 
+<!-- Modal de mensaje: oculto por defecto, se abre al clickear una tarjeta -->
+<div id="modalFondo" class="modal-fondo">
+  <div class="modal-caja">
+    <div class="modal-header">
+      <strong>Enviar mensaje a un nodo</strong>
+      <button id="modalCerrar" class="modal-x">✕</button>
+    </div>
+    <div class="modal-nodo">Nodo: <b id="modalNodoNombre"></b></div>
+    <input type="text" id="destino" readonly>
+    <label class="modal-campo">Mensaje:
+      <select id="texto">
+        <option>Reinicie servicio</option>
+        <option>Verifique espacio en disco</option>
+        <option>Actualización de configuración</option>
+      </select>
+    </label>
+    <div class="modal-acciones">
+      <button id="enviar" disabled>Enviar</button>
+      <span id="eco"></span>
+    </div>
+  </div>
 <script>
 "use strict";
-const API = "";                    // misma URL que sirve el dashboard
+const API = "";
 let timer = null;
-let cargando = false;              // evita que se solapen dos refrescos
-let idsActuales = "";              // para saber si hay que repintar el selector
+let cargando = false;
+let idsActuales = "";
+let nodoHistorialActual = null;
 
-// --------------------------------------------------------------- utilidades
-
-// TODO lo que venga de la base pasa por aqui antes de entrar en innerHTML.
-// No es paranoia: `region`, `hostname` y `disco_nombre` los manda el CLIENTE
-// por el socket. Cualquiera en la LAN puede conectarse al puerto 5050 y
-// registrarse con region "<img src=x onerror=...>", y ese texto se guardaria y
-// se ejecutaria en el navegador de todos los que miren el dashboard.
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 const gb = v => (v === null || v === undefined || isNaN(Number(v)))
   ? "—"
-  : Number(v).toLocaleString("es-BO",
-      {minimumFractionDigits:1, maximumFractionDigits:1}) + " GB";
+  : Number(v).toLocaleString("es-BO",{minimumFractionDigits:1,maximumFractionDigits:1}) + " GB";
 
-// La API devuelve las fechas en UTC y sin la "Z" final, asi que hay que
-// agregarsela: si no, el navegador las interpreta como hora local y el
-// "ultimo reporte" sale corrido 4 horas.
-// Se muestra fecha Y hora: un nodo caido hace tres dias con solo "14:32"
-// parece reciente.
 const fechaHora = t => {
   if (!t) return "nunca";
   const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
   const d = new Date(iso);
   return isNaN(d) ? "—" : d.toLocaleString("es-BO",
-    {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"});
+    {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});
 };
 
-// fetch NO lanza con 4xx/5xx: devuelve la respuesta de error, y sin este
-// control el dashboard pintaria {"detail": "..."} como si fueran datos —
-// mostrando 0% de utilizacion cuando en realidad la base esta caida.
+// "hace 2 min" — igual que fechaHora, cuidado con la Z, si no sale corrido.
+const tiempoRelativo = t => {
+  if (!t) return "";
+  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const seg = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (seg < 60) return "hace instantes";
+  if (seg < 3600) return `hace ${Math.floor(seg/60)} min`;
+  return `hace ${Math.floor(seg/3600)} h`;
+};
+
 async function pedir(ruta){
   const r = await fetch(API + ruta);
   if (!r.ok) throw new Error(`${ruta} respondio ${r.status}`);
   return r.json();
+}
+
+async function esperarAck(cmd_id) {
+  const eco = document.getElementById("eco");
+  const inicio = Date.now();
+  const LIMITE_MS = 30000;
+  const intervalo = setInterval(async () => {
+    try {
+      const mensajes = await pedir("/api/messages");
+      const msg = mensajes.find(m => m.cmd_id === cmd_id);
+      if (msg && msg.ack_en) {
+        clearInterval(intervalo);
+        eco.className = "";
+        eco.textContent = `ACK recibido a las ${fechaHora(msg.ack_en)}` +
+          (msg.rtt_ms != null ? ` · ${msg.rtt_ms} ms` : "") +
+          (msg.detalle ? ` · ${esc(msg.detalle)}` : "");
+        return;
+      }
+      if (Date.now() - inicio > LIMITE_MS) {
+        clearInterval(intervalo);
+        eco.className = "error";
+        eco.textContent = "Sin ACK después de 30s. El nodo puede estar caído.";
+      }
+    } catch (e) {}
+  }, 2000);
 }
 
 function mostrarAviso(texto){
@@ -154,76 +228,79 @@ function mostrarAviso(texto){
   else { a.style.display = "none"; }
 }
 
-// ------------------------------------------------------------------- carga
-
 async function cargar(){
-  if (cargando) return;            // el refresco anterior sigue en vuelo
+  if (cargando) return;
   cargando = true;
   try{
-    const [nodos, cl] = await Promise.all([
-      pedir("/api/nodes"),
-      pedir("/api/cluster")
-    ]);
+    const [nodos, cl] = await Promise.all([pedir("/api/nodes"), pedir("/api/cluster")]);
     mostrarAviso("");
-    pintarKpis(cl);
-    pintarTabla(nodos);
+    pintarResumen(cl, nodos);
+    pintarTarjetas(nodos);
+    actualizarSelectorHistorial(nodos);
+    if (nodoHistorialActual) cargarGraficoHistorico(nodoHistorialActual);
     document.getElementById("ultima").textContent =
       "actualizado " + new Date().toLocaleTimeString("es-BO");
   }catch(e){
-    mostrarAviso("No se pudo leer la API: " + e.message +
-                 ". Los datos de abajo pueden estar desactualizados.");
+    mostrarAviso("No se pudo leer la API: " + e.message + ". Los datos de abajo pueden estar desactualizados.");
     document.getElementById("ultima").textContent = "sin conexión con la API";
   }finally{
     cargando = false;
   }
 }
 
-function pintarKpis(c){
+function pintarResumen(c, nodos){
   const pct = Number(c.uso_pct_global ?? 0);
-  document.getElementById("kpis").innerHTML = `
-    <div class="kpi grande"><span>Utilización global</span><b>${pct.toFixed(1)}%</b></div>
-    <div class="kpi"><span>Capacidad total</span><b>${gb(c.capacidad_total_gb)}</b></div>
-    <div class="kpi"><span>Espacio libre</span><b>${gb(c.libre_total_gb)}</b></div>
-    <div class="kpi"><span>Nodos activos</span><b>${Number(c.nodos_activos ?? 0)} / ${Number(c.nodos_totales ?? 0)}</b></div>`;
+  document.getElementById("resumen").innerHTML = `
+    <div><b>${gb(c.capacidad_total_gb)}</b><span>Total</span></div>
+    <div><b>${gb(c.usado_total_gb)}</b><span>Usado</span></div>
+    <div><b>${gb(c.libre_total_gb)}</b><span>Libre</span></div>
+    <div><b>${Number(c.nodos_activos ?? 0)} / ${Number(c.nodos_totales ?? 0)}</b><span>Reportando</span></div>`;
+  document.getElementById("donutPct").textContent = pct.toFixed(0) + "%";
+  const deg = Math.min(100, Math.max(0, pct)) * 3.6;
+  document.getElementById("donut").innerHTML = `
+    <circle cx="50" cy="50" r="42" fill="none" stroke="#28313d" stroke-width="14"/>
+    <circle cx="50" cy="50" r="42" fill="none" stroke="#3fb8b0" stroke-width="14"
+      stroke-dasharray="${2*Math.PI*42}" stroke-dashoffset="${2*Math.PI*42*(1-deg/360)}"
+      transform="rotate(-90 50 50)" stroke-linecap="round"/>`;
 }
 
-function pintarTabla(nodos){
+function pintarTarjetas(nodos){
   actualizarSelector(nodos);
-
+  const cont = document.getElementById("tarjetas");
   if (!nodos.length){
-    document.getElementById("filas").innerHTML =
-      `<tr><td colspan="11" style="text-align:center;color:var(--soft);padding:28px">
-         Todavía no hay nodos registrados. Levantá los clientes.
-       </td></tr>`;
+    cont.innerHTML = `<div style="grid-column:1/-1;text-align:center;color:var(--soft);padding:28px">
+      Todavía no hay nodos registrados. Levantá los clientes.</div>`;
     return;
   }
-
-  document.getElementById("filas").innerHTML = nodos.map(n=>{
+  cont.innerHTML = nodos.map(n=>{
     const pct = Number(n.uso_pct ?? 0);
     const cls = pct >= 90 ? "alto" : pct >= 80 ? "medio" : "";
     const on  = n.estado === "ACTIVO";
-    return `<tr>
-      <td><b>${esc(n.node_id)}</b></td>
-      <td>${esc(n.region)}</td>
-      <td>${esc(n.sistema_operativo ?? "—")}</td>
-      <td>${esc(n.disco_nombre ?? "—")}</td>
-      <td>${esc(n.disco_tipo ?? "—")}</td>
-      <td class="num">${gb(n.total_gb)}</td>
-      <td class="num">${gb(n.usado_gb)}</td>
-      <td class="num">${gb(n.libre_gb)}</td>
-      <td><div class="barra"><i class="${cls}" style="width:${Math.min(100, Math.max(0, pct))}%"></i></div>
-          <small class="num">${pct.toFixed(1)}%</small></td>
-      <td><span class="pill ${on?"on":"off"}">${on?"ACTIVO":"NO REPORTA"}</span></td>
-      <td class="num">${fechaHora(n.ultimo_reporte)}</td>
-    </tr>`;
+    return `<div class="tarjeta ${on?"":"caida"}" data-node="${esc(n.node_id)}">
+      <img src="/server-icon.png" width="40" height="40" style="display: block; margin: 0 auto; filter: brightness(0) invert(1);"/>
+      <div class="t-region">${esc(n.region)}</div>
+      <div class="t-datos">
+        Node ID: ${esc(n.node_id)}<br>
+        ${esc(n.region)} (Regional)<br>
+        OS: ${esc(n.sistema_operativo ?? "—")}<br>
+        Disco: ${esc(n.disco_nombre ?? "—")}<br>
+        Tipo: ${esc(n.disco_tipo ?? "—")}<br>
+        Capacidad: ${gb(n.total_gb)}<br>
+        Usado: ${gb(n.usado_gb)}<br>
+        Libre: ${gb(n.libre_gb)}
+      </div>
+      <div class="barra"><i class="${cls}" style="width:${Math.min(100,Math.max(0,pct))}%"></i></div>
+      <div class="t-pct">${pct.toFixed(1)}% Utilización</div>
+      <span class="pill ${on?"on":"off"}">ESTADO: ${on?"ACTIVO":"NO REPORTA"}</span>
+      <div class="t-reporte">Último reporte: ${fechaHora(n.ultimo_reporte)} (${tiempoRelativo(n.ultimo_reporte)})</div>
+    </div>`;
   }).join("");
+
+  cont.querySelectorAll(".tarjeta").forEach(el=>{
+    el.onclick = () => abrirModal(el.dataset.node);
+  });
 }
 
-// Se compara la LISTA de ids, no la cantidad: si solo se mira el numero, un
-// nodo que se reemplaza por otro deja el selector apuntando al que ya no esta.
-// Y se restaura la seleccion despues de repintar, porque durante la demo del
-// alta automatica (requisito 7.2) aparece un nodo nuevo y el selector se
-// reiniciaria justo mientras el operador tiene otro elegido.
 function actualizarSelector(nodos){
   const dest = document.getElementById("destino");
   const ids = nodos.map(n => n.node_id).join("|");
@@ -237,15 +314,79 @@ function actualizarSelector(nodos){
   document.getElementById("enviar").disabled = nodos.length === 0;
 }
 
-// -------------------------------------------------------------- mensajeria
+function actualizarSelectorHistorial(nodos) {
+  const sel = document.getElementById("nodoHistorial");
+  const ids = nodos.map(n => n.node_id).join("|");
+  if (sel.dataset.ids !== ids) {
+    const elegido = sel.value;
+    sel.innerHTML = nodos.map(n =>
+      `<option value="${esc(n.node_id)}">${esc(n.node_id)}</option>`).join("");
+    if (nodos.some(n => n.node_id === elegido)) sel.value = elegido;
+    else if (nodos.length) sel.value = nodos[0].node_id;
+    sel.dataset.ids = ids;
+  }
+  if (!nodoHistorialActual && nodos.length) nodoHistorialActual = nodos[0].node_id;
+}
+document.getElementById("nodoHistorial").onchange = (e) => {
+  nodoHistorialActual = e.target.value;
+  cargarGraficoHistorico(nodoHistorialActual);
+};
+
+async function cargarGraficoHistorico(node_id) {
+  if (!node_id) return;
+  const info = document.getElementById("historial-info");
+  try {
+    const data = await pedir(`/api/history/${encodeURIComponent(node_id)}`);
+    const puntos = data.puntos || [];
+    dibujarGrafico(puntos);
+    info.textContent = puntos.length
+      ? `${puntos.length} puntos · últimas ${data.horas ?? "?"} h` : "sin datos históricos todavía";
+  } catch (e) {
+    dibujarGrafico([]);
+    info.textContent = "";
+  }
+}
+
+function dibujarGrafico(puntos) {
+  const svg = document.getElementById("grafico");
+  const W = 800, H = 220, PAD = 30;
+  if (!puntos.length) {
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="var(--soft)" font-size="13" text-anchor="middle">Sin datos históricos todavía</text>`;
+    return;
+  }
+  const n = puntos.length;
+  const x = i => PAD + (i/Math.max(1,n-1)) * (W-PAD*2);
+  const y = v => H - PAD - (v/100) * (H-PAD*2);
+  const linea = puntos.map((p,i)=>`${i===0?"M":"L"} ${x(i).toFixed(1)} ${y(Number(p.uso_pct??0)).toFixed(1)}`).join(" ");
+  const guias = [0,50,100].map(v=>`
+    <line x1="${PAD}" y1="${y(v)}" x2="${W-PAD}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/>
+    <text x="4" y="${y(v)+4}" fill="var(--soft)" font-size="10">${v}%</text>`).join("");
+  svg.innerHTML = `${guias}<path d="${linea}" fill="none" stroke="var(--acc)" stroke-width="2"/>
+    ${puntos.map((p,i)=>`<circle cx="${x(i).toFixed(1)}" cy="${y(Number(p.uso_pct??0)).toFixed(1)}" r="2.5" fill="var(--acc)"/>`).join("")}`;
+}
+
+// --------------------------------------------------------------- modal
+
+function abrirModal(node_id){
+  document.getElementById("destino").value = node_id;
+  document.getElementById("eco").textContent = "";
+  document.getElementById("eco").className = "";
+  document.getElementById("modalFondo").classList.add("visible");
+}
+function cerrarModal(){
+  document.getElementById("modalFondo").classList.remove("visible");
+}
+document.getElementById("modalCerrar").onclick = cerrarModal;
+document.getElementById("modalFondo").onclick = (e) => {
+  if (e.target.id === "modalFondo") cerrarModal();
+};
 
 document.getElementById("enviar").onclick = async () => {
   const boton = document.getElementById("enviar");
   const eco = document.getElementById("eco");
   const node_id = document.getElementById("destino").value;
-  const texto   = document.getElementById("texto").value;
+  const texto = document.getElementById("texto").value;
   if (!node_id) return;
-
   boton.disabled = true;
   eco.className = "";
   eco.textContent = "Enviando…";
@@ -257,8 +398,7 @@ document.getElementById("enviar").onclick = async () => {
     const cuerpo = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(cuerpo.detail || `HTTP ${r.status}`);
     eco.textContent = `Encolado ${String(cuerpo.cmd_id).slice(0,8)}… esperando ACK`;
-    // TODO Alex: consultar /api/messages?node_id=… y mostrar el ACK cuando
-    //            llegue, con el round-trip en ms (campo rtt_ms, tarea 4.5).
+    esperarAck(cuerpo.cmd_id);
   }catch(e){
     eco.className = "error";
     eco.textContent = "No se pudo enviar: " + e.message;
@@ -267,15 +407,11 @@ document.getElementById("enviar").onclick = async () => {
   }
 };
 
-// ------------------------------------------------------------ auto-refresh
-
 function reprogramar(){
   clearInterval(timer);
   timer = setInterval(cargar, Number(document.getElementById("refresco").value) * 1000);
 }
 document.getElementById("refresco").onchange = reprogramar;
-
-// Con la pestana en segundo plano no tiene sentido seguir sondeando la base.
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible"){ cargar(); reprogramar(); }
   else clearInterval(timer);
@@ -283,10 +419,6 @@ document.addEventListener("visibilitychange", () => {
 
 cargar();
 reprogramar();
-
-// TODO Alex: grafico historico con /api/history/<node_id> (tarea 4.6, opcional).
-//            Devuelve {node_id, horas, puntos:[{timestamp, uso_pct, ...}]} y
-//            `puntos` puede venir vacio: hay que dibujar "sin datos", no fallar.
 </script>
 </body>
 </html>
