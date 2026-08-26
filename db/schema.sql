@@ -14,8 +14,17 @@
 --      mysql -u root -p < db/schema_local.sql
 --      mysql -u root -p cns_cluster < db/schema.sql
 --
---  Es idempotente: se puede volver a correr sin romper nada.
+--  ATENCION: este script EMPIEZA BORRANDO las tablas. Se puede volver a correr
+--  cuantas veces haga falta, pero se lleva por delante todos los datos. Contra
+--  la base compartida de Aiven, correrlo destruye el trabajo de los otros
+--  cuatro: avisen en el grupo antes.
 -- ============================================================================
+
+-- Todo el sistema trabaja en UTC. Esto importa tambien aqui: las columnas con
+-- DEFAULT CURRENT_TIMESTAMP(3) se evaluan con la zona de la SESION que inserta,
+-- asi que una fila metida a mano desde el cliente de MySQL en una maquina en
+-- UTC-4 quedaria cuatro horas desplazada.
+SET time_zone = '+00:00';
 
 DROP VIEW  IF EXISTS v_cluster;
 DROP VIEW  IF EXISTS v_nodos_estado;
@@ -24,6 +33,7 @@ DROP TABLE IF EXISTS mensajes;
 DROP TABLE IF EXISTS eventos;
 DROP TABLE IF EXISTS metricas;
 DROP TABLE IF EXISTS nodos;
+
 
 -- ----------------------------------------------------------------------------
 -- 1. nodos  ·  catalogo: quien existe en el cluster
@@ -43,8 +53,11 @@ CREATE TABLE nodos (
   PRIMARY KEY (id),
   UNIQUE KEY uq_node_id (node_id),                   -- el alta automatica depende de esto
   KEY ix_estado (estado),
-  KEY ix_ultimo_reporte (ultimo_reporte)             -- lo lee el watchdog
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  KEY ix_ultimo_reporte (ultimo_reporte),            -- lo lee el watchdog
+  -- Un intervalo de 0 haria que el watchdog marque NO_REPORTA un segundo
+  -- despues de cada reporte, para siempre.
+  CONSTRAINT ck_intervalo CHECK (intervalo_seg BETWEEN 1 AND 3600)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- primer_registro documenta CUANDO se dio de alta solo un nodo: es la
 -- evidencia del requisito 7.2 que pueden mostrar en la defensa.
@@ -52,7 +65,7 @@ CREATE TABLE nodos (
 
 -- ----------------------------------------------------------------------------
 -- 2. metricas  ·  historico: una fila por reporte, nunca se sobrescribe
---    9 nodos x 1 reporte cada 10 s = ~78.000 filas/dia. Por eso el indice.
+--    9 nodos x 1 reporte cada 10 s = ~78.000 filas/dia. Por eso los indices.
 -- ----------------------------------------------------------------------------
 CREATE TABLE metricas (
   id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -68,12 +81,15 @@ CREATE TABLE metricas (
   iops_escritura  INT UNSIGNED  NOT NULL DEFAULT 0,
   latencia_ms     DECIMAL(8,3)  NOT NULL DEFAULT 0,
   PRIMARY KEY (id),
-  KEY ix_nodo_tiempo (node_id, timestamp DESC),      -- indice compuesto: sirve
-                                                     -- para "ultima de cada nodo"
-                                                     -- y para la serie temporal
+  KEY ix_nodo_tiempo (node_id, timestamp DESC, id DESC),  -- ultima metrica de un
+                                                     -- nodo (el id desempata) y
+                                                     -- serie temporal por nodo
+  KEY ix_tiempo (timestamp),                         -- consultas por ventana de
+                                                     -- tiempo SIN filtrar nodo
+                                                     -- (growth rate global)
   CONSTRAINT fk_metricas_nodo FOREIGN KEY (node_id)
       REFERENCES nodos (node_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- Por que DECIMAL y no FLOAT: sumar nueve FLOAT da cosas como 4291.999999998 y
 -- el % de utilizacion global sale con basura decimal. DECIMAL suma exacto.
@@ -93,10 +109,12 @@ CREATE TABLE eventos (
   detalle    VARCHAR(255) NULL,
   PRIMARY KEY (id),
   KEY ix_nodo_tiempo (node_id, timestamp DESC),
+  KEY ix_tiempo (timestamp DESC),                    -- la bitacora global del
+                                                     -- dashboard, sin filtro
   KEY ix_tipo (tipo),
   CONSTRAINT fk_eventos_nodo FOREIGN KEY (node_id)
       REFERENCES nodos (node_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 
 -- ----------------------------------------------------------------------------
@@ -109,7 +127,7 @@ CREATE TABLE eventos (
 --    sockets consulta cada segundo las pendientes, las envia por el socket y
 --    las pasa a 'ENVIADO'. Cuando llega el ACK, quedan en 'CONFIRMADO'.
 --
---    Ciclo:  PENDIENTE -> ENVIADO -> CONFIRMADO   (o FALLIDO si el nodo no esta)
+--    Ciclo:  PENDIENTE -> ENVIADO -> CONFIRMADO   (o FALLIDO, con su motivo)
 -- ----------------------------------------------------------------------------
 CREATE TABLE mensajes (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -120,6 +138,7 @@ CREATE TABLE mensajes (
   valor       INT NULL,                              -- para SET_INTERVAL
   estado      ENUM('PENDIENTE','ENVIADO','CONFIRMADO','FALLIDO')
                  NOT NULL DEFAULT 'PENDIENTE',
+  detalle     VARCHAR(255) NULL,                     -- por que fallo
   creado_en   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   enviado_en  DATETIME(3) NULL,
   ack_en      DATETIME(3) NULL,
@@ -129,7 +148,7 @@ CREATE TABLE mensajes (
   KEY ix_nodo (node_id, creado_en DESC),
   CONSTRAINT fk_mensajes_nodo FOREIGN KEY (node_id)
       REFERENCES nodos (node_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- La diferencia entre ack_en y enviado_en es el round-trip real del mensaje.
 -- Es un dato lindo para mostrar en el dashboard y para la defensa.
@@ -141,25 +160,37 @@ CREATE TABLE mensajes (
 -- ============================================================================
 
 -- Ultima metrica de CADA nodo.
--- Se usa ROW_NUMBER() y no "ORDER BY timestamp LIMIT 1" porque eso ultimo
--- devuelve una sola fila del cluster entero, no una por nodo. Es el error mas
--- comun de esta practica.
 --
--- REQUIERE MySQL 8.0.14 O SUPERIOR: antes de esa version no se permitian
--- subconsultas en el FROM de una vista. Verifiquen con  SELECT VERSION();
--- Si les toca una version anterior, la alternativa es hacer el ROW_NUMBER()
--- directamente en la consulta de repositorio.py en vez de en la vista.
+-- Version anterior: ROW_NUMBER() OVER (PARTITION BY node_id ...) sobre toda la
+-- tabla. Correcto, pero MySQL tiene que materializar la historia entera antes
+-- de quedarse con nueve filas: con 150.000 metricas medimos ~0,9 s por consulta
+-- y el indice ix_nodo_tiempo no se usaba nunca.
+--
+-- Version actual: se arranca desde `nodos` (9 filas) y para cada una se busca
+-- su ultima metrica con una subconsulta que SI usa ix_nodo_tiempo. Nueve
+-- busquedas por indice en vez de un recorrido completo.
+--
+-- Se ordena por (timestamp DESC, id DESC): sin el desempate por id, dos
+-- metricas del mismo nodo en el mismo milisegundo darian un resultado
+-- arbitrario y distinto en cada consulta.
+--
+-- El FORCE INDEX no es capricho. Sin el, el optimizador prefiere ix_tiempo y
+-- recorre el indice de fechas hacia atras hasta topar con el nodo buscado. Eso
+-- va bien mientras todos los nodos reporten... y se degrada justo con el nodo
+-- que dejo de reportar, que es el caso que esta practica tiene que manejar.
+-- Medido con 180.000 filas y un nodo caido: 154 ms sin hint, 62 ms con hint, y
+-- la diferencia crece con el tiempo que lleve caido.
 CREATE OR REPLACE VIEW v_ultima_metrica AS
-SELECT id, node_id, timestamp, disco_nombre, disco_tipo,
-       total_gb, usado_gb, libre_gb, uso_pct,
-       iops_lectura, iops_escritura, latencia_ms
-FROM (
-    SELECT m.*,
-           ROW_NUMBER() OVER (PARTITION BY m.node_id
-                              ORDER BY m.timestamp DESC, m.id DESC) AS rn
-    FROM metricas m
-) AS t
-WHERE rn = 1;
+SELECT m.id, m.node_id, m.timestamp, m.disco_nombre, m.disco_tipo,
+       m.total_gb, m.usado_gb, m.libre_gb, m.uso_pct,
+       m.iops_lectura, m.iops_escritura, m.latencia_ms
+FROM nodos n
+JOIN metricas m
+  ON m.id = (SELECT x.id
+               FROM metricas x FORCE INDEX (ix_nodo_tiempo)
+              WHERE x.node_id = n.node_id
+              ORDER BY x.timestamp DESC, x.id DESC
+              LIMIT 1);
 
 
 -- Estado completo de cada nodo: catalogo + su ultima medicion.
@@ -211,4 +242,5 @@ SELECT
 FROM v_nodos_estado;
 
 -- NULLIF evita la division por cero cuando todavia no reporto nadie.
--- Si les preguntan "que pasa si arrancan con cero nodos", la respuesta esta aca.
+-- Si les preguntan "que pasa si arrancan con cero nodos", la respuesta esta aca:
+-- devuelve una fila con ceros y NULL, no un error.

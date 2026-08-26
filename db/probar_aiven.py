@@ -103,4 +103,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        codigo = main()
+    finally:
+        # Este archivo predica que un hilo que termina cierra su conexion.
+        # Predicar con el ejemplo.
+        try:
+            from db.conexion import cerrar_conexion_del_hilo
+            cerrar_conexion_del_hilo()
+        except Exception:
+            pass
+    sys.exit(codigo)

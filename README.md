@@ -19,7 +19,14 @@ pip install -r requirements.txt
 
 cp .env.example .env               # pegar la clave de Aiven que pasa Robert
 python -m db.probar_aiven          # 1. verifica DNS, puerto, TLS y esquema
-python -m db.probar_bd             # 2. tiene que pasar TODO antes de seguir
+python -m db.probar_bd             # 2. 45 comprobaciones sobre la capa de datos
+```
+
+Y para comprobar que el sistema completo funciona (levanta servidor y clientes
+de verdad, 23 comprobaciones):
+
+```bash
+python scripts/prueba_integracion.py
 ```
 
 La base de desarrollo esta en **Aiven** y ya tiene el esquema cargado: no hay
@@ -36,7 +43,7 @@ mysql -u root -p cns_cluster < db/schema.sql
 python -m db.probar_bd
 ```
 
-Arranque manual (en cuatro terminales o con `./scripts/start_demo.sh`):
+Arranque manual (en tres terminales, o todo junto con `./scripts/start_demo.sh`):
 
 ```bash
 python -m servidor.main                                   # 1. sockets
@@ -59,16 +66,19 @@ storage-cluster-cns/
 │   ├── schema.sql        4 tablas + 3 vistas (Aiven y local)
 │   ├── schema_local.sql  crear base y usuario, solo para MySQL local
 │   ├── ca.pem            certificado de Aiven (publico, si va al repo)
-│   ├── conexion.py       pool de conexiones, con TLS si hace falta
+│   ├── conexion.py       una conexion por hilo, con TLS si hace falta
 │   ├── repositorio.py    TODO el SQL del proyecto vive aqui
 │   ├── probar_aiven.py   verifica DNS, puerto, TLS y esquema
 │   └── probar_bd.py      prueba de concurrencia y agregaciones
+├── scripts/         Alexander
+│   ├── lanzar_nodos.py       levanta los 9
+│   ├── prueba_integracion.py prueba end-to-end automatica
+│   └── start_demo.sh         runbook de la demo
 ├── servidor/        Edwin — accept loop, watchdog, despachador
 ├── cliente/         Martin — metricas de disco, socket, log, ACK
 ├── api/             Robert — FastAPI + modelos Pydantic
 ├── dashboard/       Alex — tabla, KPIs, auto-refresh, mensajeria
-├── scripts/         Alexander — lanzar_nodos.py, start_demo.sh
-├── docs/            protocolo.md, arquitectura.md, diagramas
+├── docs/            protocolo.md (contrato), CAMBIOS.md (revision del codigo)
 └── logs/            cliente_<node_id>.log (requisito 7.1)
 ```
 
@@ -100,6 +110,12 @@ menos de un segundo y la envía por el socket. La base de datos es el bus.
 4. **Nadie arma un JSON a mano**: se usan las funciones de `protocolo.py`.
 5. **Rama por tarea**, merge a `dev`. `main` solo recibe código que arranca.
 6. **Si no corre en LAN entre dos máquinas, no está hecho.** Localhost no cuenta.
+7. **Antes de pedir merge**, corré `python -m db.probar_bd` y
+   `python scripts/prueba_integracion.py`. Si algo se pone en rojo, tu cambio
+   rompió algo de otro.
+
+> `docs/CAMBIOS.md` explica por qué varias cosas están hechas de una forma que
+> parece rara. Léelo antes de "arreglarlas".
 
 ---
 
