@@ -78,6 +78,11 @@
   .t-pct{font-size:12px;margin:6px 0;text-align:center}
   .t-reporte{font-size:10.5px;color:var(--soft);margin-top:6px;text-align:center}
 
+  .tarjeta{position:relative}
+  .t-menu{position:absolute;top:8px;right:8px;background:none;border:none;color:var(--soft);
+          font-size:16px;line-height:1;padding:2px 6px;cursor:pointer;border-radius:4px}
+  .t-menu:hover{background:var(--line);color:var(--txt)}
+
   .modal-fondo{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);align-items:center;justify-content:center;z-index:50}
   .modal-fondo.visible{display:flex}
   .modal-caja{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:20px;width:320px}
@@ -86,6 +91,39 @@
   .modal-campo{display:block;font-size:12px;color:var(--soft);margin-bottom:12px}
   .modal-campo select{width:100%;margin-top:4px}
   .modal-acciones{display:flex;align-items:center;gap:10px}
+
+  .grafico-panel{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px;margin-bottom:24px}
+  .grafico-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .grafico-header strong{font-size:13px}
+  #historial-info{font-size:11px;color:var(--soft)}
+  .grafico-leyenda{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px}
+  .leyenda-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--soft)}
+  .leyenda-item i{width:9px;height:9px;border-radius:2px;display:inline-block}
+
+  .paneles-grafico{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+  .paneles-grafico .grafico-panel{margin-bottom:0}
+  .grafico-lineas{flex:2;min-width:340px}
+  .grafico-gauge{flex:1;min-width:230px;display:flex;flex-direction:column;align-items:center}
+  .gauge-metrics{display:flex;gap:16px;font-size:11px;color:var(--soft);margin:4px 0 2px;flex-wrap:wrap;justify-content:center}
+  .gauge-metrics b{display:block;font-size:14px;color:var(--txt)}
+  .gauge-pct{font-size:32px;font-weight:700;color:var(--acc);margin-top:-18px}
+
+
+  .detalle-caja{width:340px;position:relative;padding:20px}
+  .detalle-x{position:absolute;top:12px;right:12px}
+  .detalle-top{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px}
+  .detalle-top-info{flex:1}
+  .detalle-nombre-fila{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .detalle-nombre-fila strong{font-size:16px}
+  .detalle-sub{font-size:11.5px;color:var(--soft);margin-top:3px}
+  .detalle-seccion{margin-top:16px}
+  .detalle-seccion-header{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--soft);margin-bottom:8px}
+  .detalle-seccion-nota{font-size:10.5px}
+  .detalle-barra{height:10px;background:#232c38;border-radius:99px;overflow:hidden}
+  .detalle-barra i{display:block;height:100%;background:var(--acc)}
+  .detalle-barra-leyenda{display:flex;justify-content:space-between;margin-top:8px;font-size:11px;color:var(--soft)}
+  .detalle-barra-leyenda b{display:block;font-size:15px;color:var(--txt)}
+  .detalle-footer{margin-top:14px;font-size:11.5px;color:var(--warn);text-align:center}
 </style>
 </head>
 <body>
@@ -113,26 +151,59 @@
 
   <div class="tarjetas" id="tarjetas"></div>
 
-  <div class="caja" id="historial-caja">
-    <strong style="font-size:13px">Histórico de utilización</strong>
-    <select id="nodoHistorial"></select>
-    <span id="historial-info" style="color:var(--soft);font-size:12px;margin-left:auto"></span>
-  </div>
-  <div class="tabla-wrap" style="margin-top:10px">
-    <svg id="grafico" viewBox="0 0 800 220" style="width:100%;height:220px;background:var(--card);border:1px solid var(--line);border-radius:6px"></svg>
+  <div class="paneles-grafico">
+    <div class="grafico-panel grafico-lineas">
+      <div class="grafico-header">
+        <strong>Histórico de utilización</strong>
+        <span id="historial-info"></span>
+      </div>
+      <svg id="grafico" viewBox="0 0 800 240" style="width:100%;height:240px"></svg>
+      <div class="grafico-leyenda" id="leyenda"></div>
+    </div>
+
+    <div class="grafico-panel grafico-gauge">
+      <div class="grafico-header"><strong>Utilización global del clúster</strong></div>
+      <div class="gauge-metrics" id="gaugeMetricas"></div>
+      <svg id="gauge" viewBox="0 0 200 118" style="width:100%;max-width:260px;height:130px"></svg>
+      <div class="gauge-pct" id="gaugePct">0%</div>
+    </div>
   </div>
 
-  <!--<div class="ctrl" style="margin-top:16px">
-    <label>Auto-refresh
-      <select id="refresco">
-        <option value="2">2 s</option>
-        <option value="5" selected>5 s</option>
-        <option value="10">10 s</option>
-        <option value="30">30 s</option>
-      </select>
-    </label>
-    <span id="ultima">—</span>
-  </div> -->
+  <div id="modalDetalleFondo" class="modal-fondo">
+  <div class="modal-caja detalle-caja">
+    <button id="detalleCerrar" class="modal-x detalle-x">✕</button>
+      <div class="detalle-top">
+        <img src="/server-icon.png" width="38" height="38" style="filter: brightness(0) invert(1);"/>
+        <div class="detalle-top-info">
+          <div class="detalle-nombre-fila">
+            <strong id="detalleTitulo"></strong>
+            <span id="detalleEstadoPill" class="pill"></span>
+          </div>
+          <div class="detalle-sub" id="detalleUbicacion"></div>
+          <div class="detalle-sub" id="detalleIdIp"></div>
+        </div>
+      </div>
+
+      <div class="detalle-seccion">
+        <div class="detalle-seccion-header">
+          <span>Actualizaciones del nodo</span>
+          <span id="detalleHistInfo" class="detalle-seccion-nota"></span>
+        </div>
+        <svg id="detalleGrafico" viewBox="0 0 400 90" style="width:100%;height:90px"></svg>
+      </div>
+
+      <div class="detalle-seccion">
+        <div class="detalle-seccion-header"><span>Uso de disco</span></div>
+        <div class="detalle-barra"><i id="detalleBarraUso"></i></div>
+        <div class="detalle-barra-leyenda">
+          <div><b id="detalleUsadoPct"></b><span>Usado · <span id="detalleUsadoGb"></span></span></div>
+          <div style="text-align:right"><b id="detalleLibrePct"></b><span>Libre · <span id="detalleLibreGb"></span></span></div>
+        </div>
+      </div>
+
+      <div class="detalle-footer" id="detalleFooter"></div>
+    </div>
+  </div>
 </main>
 
 <!-- Modal de mensaje: oculto por defecto, se abre al clickear una tarjeta -->
@@ -162,7 +233,7 @@ const API = "";
 let timer = null;
 let cargando = false;
 let idsActuales = "";
-let nodoHistorialActual = null;
+let ultimosNodos = [];
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -228,6 +299,62 @@ function mostrarAviso(texto){
   else { a.style.display = "none"; }
 }
 
+async function abrirDetalle(node_id){
+  const n = ultimosNodos.find(x => x.node_id === node_id);
+  if (!n) return;
+
+  const on = n.estado === "ACTIVO";
+  document.getElementById("detalleTitulo").textContent = node_id;
+  document.getElementById("detalleEstadoPill").className = `pill ${on?"on":"off"}`;
+  document.getElementById("detalleEstadoPill").textContent = on ? "ACTIVO" : "NO REPORTA";
+  document.getElementById("detalleUbicacion").textContent = n.region ?? "—";
+  document.getElementById("detalleIdIp").textContent = `${n.ip ?? "—"} · ID: ${n.node_id}`;
+
+  const usadoPct = Number(n.uso_pct ?? 0);
+  const librePct = Math.max(0, 100 - usadoPct);
+  document.getElementById("detalleBarraUso").style.width = Math.min(100,Math.max(0,usadoPct)) + "%";
+  document.getElementById("detalleUsadoPct").textContent = usadoPct.toFixed(0) + "%";
+  document.getElementById("detalleLibrePct").textContent = librePct.toFixed(0) + "%";
+  document.getElementById("detalleUsadoGb").textContent = gb(n.usado_gb);
+  document.getElementById("detalleLibreGb").textContent = gb(n.libre_gb);
+
+  document.getElementById("detalleFooter").textContent =
+    (on ? "" : "⚠ ") + `Último reporte: ${tiempoRelativo(n.ultimo_reporte)}`;
+
+  document.getElementById("detalleHistInfo").textContent = "cargando…";
+  document.getElementById("detalleGrafico").innerHTML = "";
+  document.getElementById("modalDetalleFondo").classList.add("visible");
+
+  try{
+    const data = await pedir(`/api/history/${encodeURIComponent(node_id)}`);
+    const puntos = data.puntos || [];
+    dibujarGraficoNodo(puntos, on);
+    document.getElementById("detalleHistInfo").textContent =
+      puntos.length ? `últimas ${data.horas ?? "?"} h` : "sin datos";
+  }catch(e){
+    dibujarGraficoNodo([], on);
+    document.getElementById("detalleHistInfo").textContent = "sin datos";
+  }
+}
+
+// Linea unica del nodo: roja si esta caido, turquesa si esta activo — el
+// color mismo ya adelanta el estado antes de leer nada.
+function dibujarGraficoNodo(puntos, activo){
+  const svg = document.getElementById("detalleGrafico");
+  const W = 400, H = 90, PAD = 18;
+  if (!puntos.length){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="var(--soft)" font-size="11" text-anchor="middle">Sin datos históricos todavía</text>`;
+    return;
+  }
+  const n = puntos.length;
+  const x = i => PAD + (i/Math.max(1,n-1)) * (W-PAD*2);
+  const y = v => H - 10 - (v/100) * (H-20);
+  const d = puntos.map((p,i)=>
+    `${i===0?"M":"L"} ${x(i).toFixed(1)} ${y(Number(p.uso_pct??0)).toFixed(1)}`).join(" ");
+  const color = activo ? "var(--acc)" : "var(--mal)";
+  svg.innerHTML = `<path d="${d}" fill="none" stroke="${color}" stroke-width="2"/>`;
+}
+
 async function cargar(){
   if (cargando) return;
   cargando = true;
@@ -236,8 +363,9 @@ async function cargar(){
     mostrarAviso("");
     pintarResumen(cl, nodos);
     pintarTarjetas(nodos);
-    actualizarSelectorHistorial(nodos);
-    if (nodoHistorialActual) cargarGraficoHistorico(nodoHistorialActual);
+    ultimosNodos = nodos;
+    pintarGauge(cl);
+    cargarGraficoTodos(nodos);
     document.getElementById("ultima").textContent =
       "actualizado " + new Date().toLocaleTimeString("es-BO");
   }catch(e){
@@ -277,10 +405,11 @@ function pintarTarjetas(nodos){
     const cls = pct >= 90 ? "alto" : pct >= 80 ? "medio" : "";
     const on  = n.estado === "ACTIVO";
     return `<div class="tarjeta ${on?"":"caida"}" data-node="${esc(n.node_id)}">
+      <button class="t-menu" data-node="${esc(n.node_id)}" title="Más datos">⋮</button>
       <img src="/server-icon.png" width="40" height="40" style="display: block; margin: 0 auto; filter: brightness(0) invert(1);"/>
       <div class="t-region">${esc(n.region)}</div>
       <div class="t-datos">
-        Node ID: ${esc(n.node_id)}<br>
+        ID: ${esc(n.node_id)}<br>
         ${esc(n.region)} (Regional)<br>
         OS: ${esc(n.sistema_operativo ?? "—")}<br>
         Disco: ${esc(n.disco_nombre ?? "—")}<br>
@@ -299,6 +428,16 @@ function pintarTarjetas(nodos){
   cont.querySelectorAll(".tarjeta").forEach(el=>{
     el.onclick = () => abrirModal(el.dataset.node);
   });
+
+  // El botón de tres puntos va DENTRO de la tarjeta clickeable, así que
+  // hay que frenar la propagación: si no, cada click en "⋮" también
+  // abriría el modal de mensaje al mismo tiempo que el de detalle.
+  cont.querySelectorAll(".t-menu").forEach(btn=>{
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      abrirDetalle(btn.dataset.node);
+    };
+  });
 }
 
 function actualizarSelector(nodos){
@@ -314,55 +453,104 @@ function actualizarSelector(nodos){
   document.getElementById("enviar").disabled = nodos.length === 0;
 }
 
-function actualizarSelectorHistorial(nodos) {
-  const sel = document.getElementById("nodoHistorial");
-  const ids = nodos.map(n => n.node_id).join("|");
-  if (sel.dataset.ids !== ids) {
-    const elegido = sel.value;
-    sel.innerHTML = nodos.map(n =>
-      `<option value="${esc(n.node_id)}">${esc(n.node_id)}</option>`).join("");
-    if (nodos.some(n => n.node_id === elegido)) sel.value = elegido;
-    else if (nodos.length) sel.value = nodos[0].node_id;
-    sel.dataset.ids = ids;
-  }
-  if (!nodoHistorialActual && nodos.length) nodoHistorialActual = nodos[0].node_id;
-}
-document.getElementById("nodoHistorial").onchange = (e) => {
-  nodoHistorialActual = e.target.value;
-  cargarGraficoHistorico(nodoHistorialActual);
-};
+// Un color estable por node_id, calculado por hash del texto — así el
+// mismo nodo siempre tiene el mismo color entre refrescos, sin importar
+// el orden en que la API devuelva la lista.
 
-async function cargarGraficoHistorico(node_id) {
-  if (!node_id) return;
+function construirMapaColores(ids){
+  const ordenados = [...ids].sort();
+  const mapa = {};
+  ordenados.forEach((id, i) => {
+    const hue = (i * 137.508) % 360;
+    mapa[id] = `hsl(${hue.toFixed(0)}, 70%, 58%)`;
+  });
+  return mapa;
+}
+
+function aMs(timestamp){
+  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(timestamp) ? timestamp : timestamp + "Z";
+  return new Date(iso).getTime();
+}
+
+// Trae el historial de TODOS los nodos en paralelo. Si uno falla (nodo
+// nuevo sin historial, o timeout puntual) no tira abajo a los demás:
+// ese nodo simplemente no dibuja línea.
+async function cargarGraficoTodos(nodos){
   const info = document.getElementById("historial-info");
-  try {
-    const data = await pedir(`/api/history/${encodeURIComponent(node_id)}`);
-    const puntos = data.puntos || [];
-    dibujarGrafico(puntos);
-    info.textContent = puntos.length
-      ? `${puntos.length} puntos · últimas ${data.horas ?? "?"} h` : "sin datos históricos todavía";
-  } catch (e) {
-    dibujarGrafico([]);
-    info.textContent = "";
-  }
+  const resultados = await Promise.all(nodos.map(n =>
+    pedir(`/api/history/${encodeURIComponent(n.node_id)}`)
+      .then(d => ({ node_id: n.node_id, puntos: d.puntos || [] }))
+      .catch(() => ({ node_id: n.node_id, puntos: [] }))
+  ));
+  dibujarGraficoMultinodo(resultados);
+  info.textContent = "actualizado " + new Date().toLocaleTimeString("es-BO");
 }
 
-function dibujarGrafico(puntos) {
+function dibujarGraficoMultinodo(series){
   const svg = document.getElementById("grafico");
-  const W = 800, H = 220, PAD = 30;
-  if (!puntos.length) {
+  const leyenda = document.getElementById("leyenda");
+  const W = 800, H = 240, PAD = 34;
+
+  const conDatos = series.filter(s => s.puntos.length);
+  if (!conDatos.length){
     svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="var(--soft)" font-size="13" text-anchor="middle">Sin datos históricos todavía</text>`;
+    leyenda.innerHTML = "";
     return;
   }
-  const n = puntos.length;
-  const x = i => PAD + (i/Math.max(1,n-1)) * (W-PAD*2);
-  const y = v => H - PAD - (v/100) * (H-PAD*2);
-  const linea = puntos.map((p,i)=>`${i===0?"M":"L"} ${x(i).toFixed(1)} ${y(Number(p.uso_pct??0)).toFixed(1)}`).join(" ");
-  const guias = [0,50,100].map(v=>`
+
+  const colores = construirMapaColores(conDatos.map(s => s.node_id));
+
+  let tMin = Infinity, tMax = -Infinity;
+  conDatos.forEach(s => s.puntos.forEach(p => {
+    const t = aMs(p.timestamp);
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
+  }));
+  if (tMin === tMax) tMax = tMin + 1;
+
+  const x = t => PAD + ((t - tMin) / (tMax - tMin)) * (W - PAD * 2);
+  const y = v => H - PAD - (v / 100) * (H - PAD * 2);
+
+  const guias = [0, 50, 100].map(v => `
     <line x1="${PAD}" y1="${y(v)}" x2="${W-PAD}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/>
     <text x="4" y="${y(v)+4}" fill="var(--soft)" font-size="10">${v}%</text>`).join("");
-  svg.innerHTML = `${guias}<path d="${linea}" fill="none" stroke="var(--acc)" stroke-width="2"/>
-    ${puntos.map((p,i)=>`<circle cx="${x(i).toFixed(1)}" cy="${y(Number(p.uso_pct??0)).toFixed(1)}" r="2.5" fill="var(--acc)"/>`).join("")}`;
+
+  const lineas = conDatos.map(s => {
+    const d = s.puntos.map((p, i) =>
+      `${i === 0 ? "M" : "L"} ${x(aMs(p.timestamp)).toFixed(1)} ${y(Number(p.uso_pct ?? 0)).toFixed(1)}`
+    ).join(" ");
+    return `<path d="${d}" fill="none" stroke="${colores[s.node_id]}" stroke-width="2" opacity="0.9"/>`;
+  }).join("");
+
+  svg.innerHTML = guias + lineas;
+
+  leyenda.innerHTML = conDatos.map(s =>
+    `<span class="leyenda-item"><i style="background:${colores[s.node_id]}"></i>${esc(s.node_id)}</span>`
+  ).join("");
+}
+
+function pintarGauge(c){
+  const pct = Math.min(100, Math.max(0, Number(c.uso_pct_global ?? 0)));
+  document.getElementById("gaugeMetricas").innerHTML = `
+    <div><b>${gb(c.capacidad_total_gb)}</b>Total</div>
+    <div><b>${gb(c.usado_total_gb)}</b>Usado</div>
+    <div><b>${gb(c.libre_total_gb)}</b>Libre</div>`;
+  document.getElementById("gaugePct").textContent = pct.toFixed(1) + "%";
+
+  const r = 80, cx = 100, cy = 100;
+  const circunferencia = Math.PI * r;
+  const dash = circunferencia * (pct / 100);
+  // mismo umbral 80/90 que ya usa la barra de cada tarjeta, para que el
+  // color signifique lo mismo en toda la interfaz.
+  const color = pct >= 90 ? "var(--mal)" : pct >= 80 ? "var(--warn)" : "var(--acc)";
+
+  document.getElementById("gauge").innerHTML = `
+    <path d="M${cx-r},${cy} A${r},${r} 0 0 1 ${cx+r},${cy}"
+      fill="none" stroke="var(--line)" stroke-width="16" stroke-linecap="round"/>
+    <path d="M${cx-r},${cy} A${r},${r} 0 0 1 ${cx+r},${cy}"
+      fill="none" stroke="${color}" stroke-width="16" stroke-linecap="round"
+      stroke-dasharray="${dash.toFixed(1)} ${circunferencia.toFixed(1)}"/>
+  `;
 }
 
 // --------------------------------------------------------------- modal
@@ -374,8 +562,18 @@ function abrirModal(node_id){
   document.getElementById("modalFondo").classList.add("visible");
 }
 function cerrarModal(){
+
   document.getElementById("modalFondo").classList.remove("visible");
 }
+
+function cerrarDetalle(){
+  document.getElementById("modalDetalleFondo").classList.remove("visible");
+}
+document.getElementById("detalleCerrar").onclick = cerrarDetalle;
+document.getElementById("modalDetalleFondo").onclick = (e) => {
+  if (e.target.id === "modalDetalleFondo") cerrarDetalle();
+};
+
 document.getElementById("modalCerrar").onclick = cerrarModal;
 document.getElementById("modalFondo").onclick = (e) => {
   if (e.target.id === "modalFondo") cerrarModal();
