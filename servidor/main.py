@@ -1,8 +1,8 @@
 """
-Nodo Central de Monitoreo — modulo M2.  Responsable: Edwin.
+Nodo Central de Monitoreo — modulo M2 (v2).  Responsable: Edwin.
 
     python -m servidor.main
-    python -m servidor.probar_concurrencia   # prueba de 9 nodos + watchdog
+    python -m servidor.probar_concurrencia     # 9 nodos + watchdog
     python -m servidor.probar_alta_automatica  # M2.2 / requisito 7.2 en caliente
     python -m servidor.probar_watchdog         # M2.3 / estado No Reporta
     python -m servidor.probar_mensajeria       # M2.4 / CMD + ACK + broadcast
@@ -11,7 +11,7 @@ Nodo Central de Monitoreo — modulo M2.  Responsable: Edwin.
     python -m servidor.consolidados            # reporte consolidados + N/A
     python -m servidor.mensajeria --help       # encolar desde terminal (demo)
 
-Tareas 2.1–2.6:
+Tareas 2.1-2.6:
     2.1  accept loop multicliente, un hilo por conexion
     2.2  registro automatico al recibir HELLO (requisito 7.2)
     2.3  watchdog con umbral por nodo (factor x intervalo_seg)
@@ -21,9 +21,12 @@ Tareas 2.1–2.6:
 
 Hilos que levanta este proceso:
     1. principal       -> accept() en bucle, un hilo nuevo por cliente
-    2. atender_cliente -> uno por conexion; recibe HELLO, METRIC y ACK
-    3. watchdog        -> marca NO_REPORTA y RECUPERADO
+    2. atender_cliente -> uno por conexion; recibe HELLO, METRIC, METRIC_BATCH,
+                          ACK y PONG
+    3. watchdog        -> marca NO_REPORTA, RECUPERADO e INTERMITENTE
     4. despachador     -> lee mensajes PENDIENTE de la BD y los envia
+    5. latido          -> manda PING a cada nodo para detectar conexiones
+                          medio abiertas (v2)
 
 CONCURRENCIA — dos candados distintos (DEFENSA: buscar comentarios # DEFENSA:):
 
@@ -36,6 +39,19 @@ CONCURRENCIA — dos candados distintos (DEFENSA: buscar comentarios # DEFENSA:)
                      Dos hilos pueden escribir en el mismo socket (el despachador
                      manda un CMD mientras el hilo del cliente manda METRIC_OK)
                      y sin candado sus bytes se intercalan.
+
+LA HORA LA PONE ESTE PROCESO (v2)
+---------------------------------
+Ninguna metrica se guarda con la hora que dice el cliente. El cliente manda su
+reloj MONOTONICO y el servidor calcula:
+
+    edad_de_la_muestra = (mono_del_envio - mono_de_la_muestra) / 1e9
+    timestamp          = hora_de_ESTE_servidor - edad_de_la_muestra
+
+Para una metrica en vivo la edad es de milisegundos y el timestamp es "ahora".
+Para un lote que llego dos horas tarde, cada muestra queda fechada en el
+momento en que se tomo de verdad. Cambiar la hora del cliente no mueve nada:
+lo unico que hace es aparecer como desvio en la bitacora.
 """
 from __future__ import annotations
 
@@ -43,6 +59,7 @@ import logging
 import signal
 import socket
 import threading
+from datetime import datetime, timezone
 
 from comun import config, protocolo
 from db import repositorio as repo
@@ -61,6 +78,15 @@ CONECTADOS: dict[str, tuple[socket.socket, threading.Lock]] = {}
 CANDADO = threading.Lock()          # DEFENSA: protege SOLO el dict CONECTADOS
 APAGANDO = threading.Event()
 _servidor_sock: socket.socket | None = None
+
+def _ahora_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# El fechado de las muestras vive en comun/protocolo.py: es parte del contrato
+# (define que significan mono_ns y mono_envio_ns) y asi se puede probar sin
+# levantar MySQL. Ver protocolo.fechar_muestra y scripts/prueba_offline.py.
+_fechar = protocolo.fechar_muestra
 
 
 def _cerrar_socket(sock: socket.socket) -> None:
@@ -123,12 +149,65 @@ def _quitar_conectado(node_id: str, sock: socket.socket) -> int:
         return len(CONECTADOS)
 
 
+# ================================================= deteccion de unidades (v2)
+
+def _revisar_discos(node_id: str, recursos: list[dict],
+                    previos: dict[str, float]) -> dict[str, float]:
+    """
+    Compara los discos de esta muestra con los de la anterior y deja un evento
+    si algo cambio: enchufaron un pendrive, lo sacaron, o una unidad cambio de
+    tamano.
+
+    Esto es lo que responde el caso de la laptop de Santa Cruz: se le enchufa
+    un pendrive y la capacidad del nodo sube. El servidor lo detecta SOLO,
+    porque compara lo que le llega con lo que le llegaba antes; no hace falta
+    que nadie avise ni reiniciar nada.
+
+    `previos` viaja en la sesion y no se consulta a la base en cada metrica: a
+    9 nodos cada 10 s serian 78.000 consultas al dia para detectar algo que
+    pasa dos veces al mes.
+
+    El umbral de 0.5 GB evita un evento por cada redimension menor de una
+    particion o por el redondeo de un snapshot.
+    """
+    actuales = {
+        r["nombre"]: float((r.get("metricas") or {}).get("total_gb") or 0)
+        for r in recursos if r.get("tipo") == protocolo.REC_DISCO
+    }
+    if not actuales:
+        return previos
+    if not previos:
+        return actuales
+
+    for nombre, total in actuales.items():
+        if nombre not in previos:
+            repo.registrar_evento(
+                node_id, "DISCO_AGREGADO",
+                f"Unidad nueva {nombre} ({total} GB); capacidad del nodo +{total} GB")
+            log.info("*** DISCO AGREGADO en %s: %s (%s GB) ***",
+                     node_id, nombre, total)
+        elif abs(total - previos[nombre]) > 0.5:
+            repo.registrar_evento(
+                node_id, "CAPACIDAD_CAMBIADA",
+                f"{nombre}: {previos[nombre]} GB -> {total} GB")
+            log.info("*** CAPACIDAD CAMBIADA en %s: %s de %s a %s GB ***",
+                     node_id, nombre, previos[nombre], total)
+    for nombre in previos:
+        if nombre not in actuales:
+            repo.registrar_evento(node_id, "DISCO_REMOVIDO",
+                                  f"Se quito la unidad {nombre}")
+            log.info("*** DISCO REMOVIDO en %s: %s ***", node_id, nombre)
+    return actuales
+
+
 # ============================================================ hilo por cliente
 
 def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
     ip = direccion[0]
     node_id: str | None = None
     candado_envio = threading.Lock()  # DEFENSA: lock por socket (escritura)
+    discos_previos: dict[str, float] = {}
+    motivo_cierre = "Conexion cerrada por el cliente"
     log.info("Conexion entrante desde %s", ip)
 
     # Sin timeout, una conexion "medio abierta" (cable desenchufado, firewall
@@ -141,6 +220,7 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
 
     try:
         for mensaje in protocolo.LectorLineas(sock):
+            recibido = _ahora_utc()
             try:
                 tipo = mensaje.get("tipo")
 
@@ -168,14 +248,24 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                             candado_envio)
                         return
 
+                    # Desvio del reloj del nodo. NO cambia como se guardan las
+                    # metricas: es informacion para el operador.
+                    desvio = protocolo.desvio_de_reloj(mensaje.get("timestamp", ""))
+                    pendientes = int(mensaje.get("pendientes") or 0)
+
                     try:
-                        es_nuevo, intervalo = repo.registrar_nodo(
+                        es_nuevo, intervalo, recursos_pedidos = repo.registrar_nodo(
                             node_id=node_id,
                             region=mensaje.get("region", "Desconocida"),
+                            sede=mensaje.get("sede"),
                             hostname=mensaje.get("hostname"),
                             so=mensaje.get("so"),
                             ip=ip,
                             intervalo=mensaje.get("intervalo", config.INTERVALO_DEFECTO_SEG),
+                            agente=mensaje.get("agente"),
+                            capacidades=mensaje.get("capacidades"),
+                            desvio_reloj=desvio,
+                            pendientes=pendientes,
                         )
                     except Exception as e:                            # noqa: BLE001
                         # Si la base falla, hay que liberar el cupo en CONECTADOS
@@ -190,17 +280,38 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                         return
 
                     sock.settimeout(config.FACTOR_TIMEOUT * intervalo)
-                    protocolo.enviar(sock, protocolo.hello_ok(True, es_nuevo, intervalo),
-                                     candado_envio)
+                    protocolo.enviar(sock, protocolo.hello_ok(
+                        True, es_nuevo, intervalo,
+                        recursos_pedidos=recursos_pedidos,
+                        desvio_seg=desvio), candado_envio)
+
+                    if desvio is not None and abs(desvio) > config.UMBRAL_RELOJ_SEG:
+                        log.warning("*** RELOJ DESVIADO: %s va %+.1f s respecto "
+                                    "al servidor; se usa la hora del servidor ***",
+                                    node_id, desvio)
+                        try:
+                            repo.guardar_desvio_reloj(node_id, desvio)
+                        except Exception:                             # noqa: BLE001
+                            log.exception("No se pudo registrar el desvio de reloj")
+
                     if es_nuevo:
                         log.info(
-                            "*** ALTA AUTOMATICA (7.2): %s (%s) — aparece solo en "
-                            "dashboard, evento ALTA_AUTOMATICA, estado ACTIVO ***",
-                            node_id, mensaje.get("region"))
+                            "*** ALTA AUTOMATICA (7.2): %s — %s / %s — aparece "
+                            "solo en el dashboard, evento ALTA_AUTOMATICA, "
+                            "estado ACTIVO ***",
+                            node_id, mensaje.get("region"),
+                            mensaje.get("sede") or mensaje.get("region"))
                     else:
                         log.info("Reconecta %s (%s) intervalo=%ss (conectados=%d)",
                                  node_id, mensaje.get("region"), intervalo,
                                  _cantidad_conectados())
+                    if pendientes:
+                        log.info("%s trae %d muestras guardadas de su ultima "
+                                 "caida; va a sincronizarlas", node_id, pendientes)
+                    try:
+                        discos_previos = repo.discos_conocidos(node_id)
+                    except Exception:                                 # noqa: BLE001
+                        discos_previos = {}
                     threading.current_thread().name = f"cliente-{node_id}"
 
                 # ---------------------------------------------- METRIC
@@ -218,10 +329,75 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                     if not isinstance(disco, dict):
                         log.warning("METRIC de %s sin bloque 'disco'", node_id)
                         continue
-                    repo.guardar_metrica(
-                        node_id, mensaje.get("timestamp", ""), disco)
+
+                    seq = int(mensaje.get("seq") or 0)
+                    # LA HORA LA PONE EL SERVIDOR (ver el docstring del modulo).
+                    momento = _fechar(mensaje.get("mono_envio_ns"),
+                                      mensaje.get("mono_ns"), recibido)
+                    recursos = protocolo.validar_recursos(mensaje.get("recursos"))
+
+                    repo.guardar_metrica(node_id, momento, disco, seq=seq,
+                                         origen="VIVO",
+                                         t_cliente=mensaje.get("timestamp"))
+                    if recursos:
+                        repo.guardar_recursos(node_id, momento, recursos,
+                                              seq=seq, origen="VIVO")
+                        discos_previos = _revisar_discos(node_id, recursos,
+                                                         discos_previos)
+                    if seq:
+                        repo.avanzar_seq(node_id, seq)
                     # M2.5: cada METRIC alimenta metricas -> v_cluster y growth
-                    protocolo.enviar(sock, protocolo.metric_ok(), candado_envio)
+                    protocolo.enviar(sock, protocolo.metric_ok(seq), candado_envio)
+
+                # ---------------------------------------- METRIC_BATCH (v2)
+                # El proceso de sincronizacion: el nodo estuvo sin red, guardo
+                # todo en su base local y ahora lo entrega.
+                elif tipo == "METRIC_BATCH":
+                    if node_id is None:
+                        continue
+                    crudas = mensaje.get("muestras")
+                    if not isinstance(crudas, list) or not crudas:
+                        protocolo.enviar(sock, protocolo.sync_ok(0, 0),
+                                         candado_envio)
+                        continue
+
+                    mono_envio = mensaje.get("mono_envio_ns")
+                    preparadas = []
+                    for m in crudas[:protocolo.MAX_MUESTRAS_LOTE]:
+                        if not isinstance(m, dict):
+                            continue
+                        d = m.get("disco")
+                        if not isinstance(d, dict):
+                            continue
+                        preparadas.append({
+                            "seq": int(m.get("seq") or 0),
+                            # Cada muestra se fecha con SU antiguedad: un lote
+                            # que cubre dos horas queda repartido en esas dos
+                            # horas, no apilado en el instante de llegada.
+                            "timestamp": _fechar(mono_envio, m.get("mono_ns"),
+                                                 recibido),
+                            "t_cliente": m.get("timestamp"),
+                            "disco": d,
+                            "recursos": protocolo.validar_recursos(m.get("recursos")),
+                        })
+
+                    insertadas, duplicadas = repo.guardar_lote(node_id, preparadas)
+                    mayor = max((m["seq"] for m in preparadas), default=0)
+                    protocolo.enviar(
+                        sock, protocolo.sync_ok(mayor, insertadas, duplicadas),
+                        candado_envio)
+
+                    if insertadas:
+                        log.info("*** SINCRONIZACION: %s recupero %d muestras "
+                                 "(hasta seq=%d, %d duplicadas descartadas) ***",
+                                 node_id, insertadas, mayor, duplicadas)
+                        repo.registrar_evento(
+                            node_id, "SINCRONIZACION",
+                            f"{insertadas} muestras recuperadas del buffer local "
+                            f"(hasta seq {mayor})")
+                    elif duplicadas:
+                        log.info("Lote de %s ya estaba guardado (%d duplicadas)",
+                                 node_id, duplicadas)
 
                 # ---------------------------------------------- ACK
                 elif tipo == "ACK":
@@ -241,6 +417,12 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                             node_id, cmd_id,
                         )
 
+                # ---------------------------------------------- PONG (v2)
+                elif tipo == "PONG":
+                    # No hace falta hacer nada: haber podido LEER el PONG ya
+                    # prueba que la conexion sigue viva en los dos sentidos.
+                    log.debug("PONG de %s", node_id)
+
             except Exception as e:                                # noqa: BLE001
                 # Un mensaje malo (un campo raro, un fallo puntual de la base)
                 # no puede cerrar la sesion de un nodo: se registra y se sigue
@@ -249,13 +431,18 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
                               mensaje.get("tipo"), node_id or ip, e)
 
     except socket.timeout:
+        motivo_cierre = (f"Sin datos dentro del umbral "
+                         f"({config.FACTOR_TIMEOUT}x su intervalo)")
         log.warning("Sin datos de %s dentro del umbral; cierro la conexion",
                     node_id or ip)
     except protocolo.ErrorProtocolo as e:
+        motivo_cierre = f"Protocolo violado: {e}"
         log.warning("Protocolo violado por %s: %s", node_id or ip, e)
     except OSError as e:
+        motivo_cierre = f"Conexion perdida a nivel de red: {e}"
         log.warning("Conexion perdida con %s: %s", node_id or ip, e)
     except Exception as e:                                        # noqa: BLE001
+        motivo_cierre = f"Error inesperado: {e}"
         log.exception("Error inesperado atendiendo a %s: %s", node_id or ip, e)
     finally:
         # Cada paso va protegido: si el primero falla, los siguientes TIENEN
@@ -264,11 +451,15 @@ def atender_cliente(sock: socket.socket, direccion: tuple[str, int]) -> None:
         if node_id:
             try:
                 quedan = _quitar_conectado(node_id, sock)
-                log.info("Desconectado %s (quedan %d)", node_id, quedan)
+                log.info("Desconectado %s (quedan %d): %s",
+                         node_id, quedan, motivo_cierre)
             except Exception:                                     # noqa: BLE001
                 log.exception("No se pudo quitar %s de CONECTADOS", node_id)
             try:
-                repo.registrar_evento(node_id, "DESCONEXION", f"Cierre desde {ip}")
+                # v2: la fecha y el MOTIVO quedan en la fila del nodo, no solo
+                # en la bitacora. Es lo que el dashboard muestra como
+                # "se desconecto de la red el ...".
+                repo.registrar_desconexion(node_id, f"{motivo_cierre} (desde {ip})")
             except Exception:                                     # noqa: BLE001
                 log.exception("No se pudo registrar la desconexion de %s", node_id)
         try:
@@ -295,6 +486,11 @@ def watchdog() -> None:
     Si paso -> marca NO_REPORTA + evento en tabla eventos.
     Si el nodo vuelve a reportar -> ACTIVO + evento RECUPERADO (failover).
 
+    v2: ademas marca INTERMITENTE a los que se caen y vuelven varias veces
+    dentro de una ventana. Un nodo que parpadea es un problema distinto a uno
+    caido — y en un dashboard donde solo hay dos colores, el que parpadea se
+    ve verde la mitad del tiempo y nadie lo mira nunca.
+
     Este hilo es el UNICO que escribe nodos.estado. Ni atender_cliente ni
     registrar_nodo tocan el estado: asi cada transicion queda en eventos.
     """
@@ -304,8 +500,10 @@ def watchdog() -> None:
         "Watchdog activo (M2.3): cada %ds, umbral = %dx intervalo_seg de cada nodo",
         periodo, factor,
     )
+    ciclo = 0
     try:
         while not APAGANDO.wait(periodo):
+            ciclo += 1
             try:
                 for node_id in repo.marcar_nodos_caidos(factor):
                     log.warning(
@@ -319,10 +517,67 @@ def watchdog() -> None:
                         "ACTIVO + evento RECUPERADO (failover) ***",
                         node_id,
                     )
+                # La intermitencia se revisa mas espaciada: cuenta eventos en
+                # una ventana de minutos, no hace falta mirarla cada 2 s.
+                if ciclo % 5 == 0:
+                    for node_id in repo.marcar_intermitentes(
+                            config.INTERMITENCIA_VENTANA_MIN,
+                            config.INTERMITENCIA_CAIDAS):
+                        log.warning(
+                            "*** FALLO INTERMITENTE: %s se cayo %d o mas veces "
+                            "en %d min ***", node_id,
+                            config.INTERMITENCIA_CAIDAS,
+                            config.INTERMITENCIA_VENTANA_MIN)
             except Exception as e:                                # noqa: BLE001
                 # Un ciclo fallido no puede matar el watchdog: los otros nodos
                 # siguen dependiendo de el para detectar caidas.
                 log.error("Error en watchdog: %s", e)
+    finally:
+        cerrar_conexion_del_hilo()
+
+
+# ==================================================================== latido
+
+def latido() -> None:
+    """
+    M2.7 (v2) — PING de aplicacion a todos los nodos conectados.
+
+    POR QUE HACE FALTA si ya hay TCP keepalive y un timeout de socket:
+
+      * El keepalive del sistema operativo tarda por defecto DOS HORAS en
+        disparar en Linux, y configurarlo por socket no es portable.
+      * El timeout de recv solo detecta que no LLEGA nada. Si el nodo esta vivo
+        pero la ruta de vuelta esta cortada (un NAT que expiro, un firewall
+        asimetrico), el servidor recibe metricas y cree que puede contestar,
+        pero sus CMD no llegan a ninguna parte. Eso se descubre recien cuando
+        alguien manda un mensaje desde el dashboard y no vuelve el ACK.
+
+    Escribir en el socket es lo unico que prueba que el camino de IDA funciona.
+    Si el sendall falla, la conexion esta rota y se cierra: el hilo del cliente
+    se desbloquea y registra la desconexion con su motivo.
+
+    Se manda con cmd_id vacio a proposito: no es un mensaje del operador, no va
+    a la tabla `mensajes` y el cliente no responde ACK, solo PONG.
+    """
+    if not config.PERIODO_PING_SEG:
+        log.info("Latido desactivado (PERIODO_PING_SEG=0)")
+        return
+    log.info("Latido activo (v2, cada %ds)", config.PERIODO_PING_SEG)
+    try:
+        while not APAGANDO.wait(config.PERIODO_PING_SEG):
+            with CANDADO:               # DEFENSA: copia rapida, sin I/O dentro
+                destinos = list(CONECTADOS.items())
+            for node_id, (sock, candado) in destinos:
+                try:
+                    protocolo.enviar(
+                        sock, protocolo.cmd("", protocolo.ACCION_PING), candado)
+                except OSError as e:
+                    log.warning("El nodo %s no acepta escrituras (%s): "
+                                "conexion medio abierta, la cierro", node_id, e)
+                    _quitar_conectado(node_id, sock)
+                    _cerrar_socket(sock)
+                except Exception as e:                            # noqa: BLE001
+                    log.exception("Error mandando PING a %s: %s", node_id, e)
     finally:
         cerrar_conexion_del_hilo()
 
@@ -437,12 +692,15 @@ def main() -> None:
     servidor.settimeout(1.0)            # permite revisar APAGANDO entre accepts
     log.info("Escuchando en %s:%d (max %d nodos)",
              config.SOCKET_HOST, config.SOCKET_PORT, config.MAX_NODOS)
+    log.info("Las metricas se fechan con la hora de ESTE servidor "
+             "(el reloj del cliente no decide nada)")
 
     # NO son daemon: queremos poder esperarlos al apagar para que cierren sus
     # conexiones a MySQL en vez de que el interprete los mate a mitad.
     hilos_fondo = [
         threading.Thread(target=watchdog, name="watchdog"),
         threading.Thread(target=despachador, name="despachador"),
+        threading.Thread(target=latido, name="latido"),
     ]
     for h in hilos_fondo:
         h.start()

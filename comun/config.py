@@ -74,7 +74,13 @@ if _ssl_ca:
 # --- Sockets ---
 SOCKET_HOST = _texto("SOCKET_HOST", "0.0.0.0")
 SOCKET_PORT = _entero("SOCKET_PORT", 5050, 1, 65535)
-MAX_NODOS = _entero("MAX_NODOS", 9, 1, 100)
+# El enunciado pide "soporte exacto para 9 clientes". Se respeta: el servidor
+# rechaza al que sobra con un ERROR explicito. Pero el limite es un PARAMETRO,
+# no un numero escrito en el codigo, porque el cluster real crece: La Paz tiene
+# dos servidores, y en la demo se agrega una computadora mas en caliente para
+# mostrar el requisito 7.2. Para la defensa "9 exactos" basta con MAX_NODOS=9
+# en el .env y el rechazo del decimo sale igual.
+MAX_NODOS = _entero("MAX_NODOS", 12, 1, 100)
 
 # --- Reglas de monitoreo ---
 INTERVALO_MIN_SEG = 1
@@ -98,6 +104,49 @@ def acotar_intervalo(segundos: object) -> int:
     return max(INTERVALO_MIN_SEG, min(INTERVALO_MAX_SEG, valor))
 
 
+# --- Recursos que se reportan (v2) ---
+# El cliente sabe medir varias cosas; esta lista decide cuales manda. Se puede
+# cambiar por nodo desde el dashboard (CMD SET_RECURSOS) sin tocar el .env de
+# esa maquina. "disco" siempre va: es el requisito del enunciado.
+RECURSOS_DISPONIBLES = ("disco", "discos", "ram", "cpu", "red")
+_crudo_recursos = _texto("RECURSOS", "disco,discos,ram,cpu")
+RECURSOS_DEFECTO = [r for r in
+                    (x.strip().lower() for x in _crudo_recursos.split(","))
+                    if r in RECURSOS_DISPONIBLES] or ["disco"]
+
+# --- Base local del cliente y sincronizacion (v2) ---
+# El cliente guarda TODA muestra en su propia base SQLite, haya red o no. Al
+# reconectar manda lo pendiente en lotes. Estos numeros acotan cuanto puede
+# crecer ese archivo si el nodo pasa dias sin servidor.
+BUFFER_MAX_MUESTRAS = _entero("BUFFER_MAX_MUESTRAS", 20000, 100, 5_000_000)
+BUFFER_RETENCION_HORAS = _entero("BUFFER_RETENCION_HORAS", 72, 1, 8760)
+SYNC_TAM_LOTE = _entero("SYNC_TAM_LOTE", 100, 1, 500)
+# Pausa entre lotes: sin ella, un nodo con 20.000 muestras atrasadas satura al
+# servidor y a MySQL justo cuando los otros ocho estan reportando normal.
+SYNC_PAUSA_SEG = _entero("SYNC_PAUSA_MS", 150, 0, 10000) / 1000.0
+
+# --- Reloj (v2) ---
+# La hora de una metrica la pone SIEMPRE el servidor (ver comun/protocolo.py).
+# Este umbral solo decide a partir de que desvio se deja constancia en la
+# bitacora de que ese nodo tiene el reloj mal.
+UMBRAL_RELOJ_SEG = _entero("UMBRAL_RELOJ_SEG", 60, 1, 86400)
+
+# --- Deteccion de fallos intermitentes (v2) ---
+# El servidor manda un PING de aplicacion cada tantos segundos. Un cable
+# cortado o un wifi caido no producen FIN: sin este latido, la conexion queda
+# "medio abierta" y el hilo espera bloqueado hasta el timeout del socket.
+PERIODO_PING_SEG = _entero("PERIODO_PING_SEG", 15, 0, 3600)
+# Cuantas caidas en la ventana hacen que un nodo se marque INTERMITENTE. Un
+# nodo que va y viene es un problema distinto a uno que se cayo y ya.
+INTERMITENCIA_CAIDAS = _entero("INTERMITENCIA_CAIDAS", 3, 2, 100)
+INTERMITENCIA_VENTANA_MIN = _entero("INTERMITENCIA_VENTANA_MIN", 10, 1, 1440)
+
+# --- WebSocket del dashboard (v2) ---
+# Cada cuanto la API mira la base y difunde el estado a los navegadores
+# conectados. El dashboard ya no hace F5 ni polling: recibe el empujon.
+PERIODO_WS_SEG = _entero("PERIODO_WS_MS", 1000, 200, 60000) / 1000.0
+WS_MAX_CLIENTES = _entero("WS_MAX_CLIENTES", 50, 1, 1000)
+
 # --- API ---
 API_HOST = _texto("API_HOST", "0.0.0.0")
 API_PORT = _entero("API_PORT", 8000, 1, 65535)
@@ -111,6 +160,8 @@ API_HILOS = _entero("API_HILOS", 6, 1, 40)
 # --- Rutas ---
 DIR_LOGS = RAIZ / "logs"
 DIR_DASHBOARD = RAIZ / "dashboard"
+# Base local de cada cliente: datos/cliente_<node_id>.db
+DIR_DATOS = RAIZ / "datos"
 
 
 def asegurar_directorios() -> None:
@@ -119,13 +170,20 @@ def asegurar_directorios() -> None:
     no tiene permiso de escritura, importar config no puede fallar.
     """
     DIR_LOGS.mkdir(parents=True, exist_ok=True)
+    DIR_DATOS.mkdir(parents=True, exist_ok=True)
 
 
 # --- Las 9 regionales de la CNS ---
 # Nombres unicos y acordados. No inventar otros: el dashboard, la BD y la
 # presentacion tienen que decir exactamente lo mismo.
+# La REGION YA NO ES LA IDENTIDAD DEL NODO: el node_id lo es. La Paz tiene dos
+# servidores (01 y 10) y el dashboard los agrupa bajo la misma regional con su
+# subtotal. Agregar una computadora nueva es agregar una linea aqui — o ni eso:
+# un cliente con un node_id que no este en esta lista se da de alta solo
+# (requisito 7.2). Esta lista solo la usa scripts/lanzar_nodos.py para la demo.
 REGIONALES = [
     ("CNS-LPZ-01", "La Paz"),
+    ("CNS-ELA-10", "La Paz"),          # segunda sede del departamento: El Alto
     ("CNS-CBB-02", "Cochabamba"),
     ("CNS-SCZ-03", "Santa Cruz"),
     ("CNS-ORU-04", "Oruro"),
@@ -135,3 +193,47 @@ REGIONALES = [
     ("CNS-BEN-08", "Beni"),
     ("CNS-PAN-09", "Pando"),
 ]
+
+# DEPARTAMENTO vs SEDE
+# --------------------
+# El enunciado habla de NUEVE administraciones regionales: eso es el
+# DEPARTAMENTO, y es lo que va en `region`. La SEDE es la oficina concreta
+# donde esta fisicamente ese servidor.
+#
+# La diferencia importa porque un departamento puede tener mas de una oficina:
+# el departamento de La Paz atiende desde la ciudad de La Paz Y desde El Alto,
+# y cada una tiene su propio servidor de archivos. Son dos maquinas, dos
+# node_id, dos filas en la base — pero UNA sola regional en el consolidado.
+#
+# Por eso el dashboard agrupa por `region` y muestra la `sede` dentro: la
+# pregunta "cuanto almacenamiento tiene La Paz" se responde sumando sus dos
+# sedes, no eligiendo una.
+#
+# Esta lista es solo para la demo (scripts/lanzar_nodos.py). Un nodo manda su
+# propia sede en el HELLO, asi que una maquina nueva puede unirse con la sede
+# que quiera sin tocar este archivo.
+SEDES = {
+    "CNS-LPZ-01": "La Paz",
+    "CNS-ELA-10": "El Alto",
+    "CNS-CBB-02": "Cochabamba",
+    "CNS-SCZ-03": "Santa Cruz de la Sierra",
+    "CNS-ORU-04": "Oruro",
+    "CNS-PTS-05": "Potosi",
+    "CNS-CHU-06": "Sucre",
+    "CNS-TJA-07": "Tarija",
+    "CNS-BEN-08": "Trinidad",
+    "CNS-PAN-09": "Cobija",
+}
+
+
+def sede_de(node_id: str, region: str = "") -> str:
+    """
+    Sede de un nodo conocido. Si no esta en la lista (una computadora que se
+    suma en caliente), se usa el nombre del departamento: es mejor que dejarlo
+    vacio y que el dashboard muestre un hueco.
+
+    REGIONALES sigue siendo una lista de PARES y no de tercias a proposito: hay
+    seis archivos de prueba que hacen `for nid, region in config.REGIONALES`, y
+    romperlos por un campo opcional a dias de la defensa no vale la pena.
+    """
+    return SEDES.get(node_id) or region or "Sin sede"

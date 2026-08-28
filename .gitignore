@@ -10,3 +10,16 @@ logs/*.log
 .idea/
 .vscode/
 .DS_Store
+
+# Base local de cada nodo cliente (v2). Son datos de esa maquina, no del
+# proyecto: cada nodo genera la suya al arrancar.
+datos/
+*.db
+*.db-wal
+*.db-shm
+
+# Copias de seguridad de la migracion a la v2
+*.bak
+
+# Copias de los archivos originales antes de la migracion a la v2
+_respaldo_v1/

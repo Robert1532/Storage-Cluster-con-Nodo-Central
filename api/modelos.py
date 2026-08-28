@@ -26,7 +26,10 @@ from pydantic import BaseModel, Field
 
 class NodoOut(BaseModel):
     node_id: str
+    # region = departamento (las nueve regionales). sede = la oficina concreta:
+    # el departamento de La Paz tiene sede La Paz y sede El Alto.
     region: str
+    sede: str | None = None
     hostname: str | None = None
     sistema_operativo: str | None = None
     ip: str | None = None
@@ -46,6 +49,43 @@ class NodoOut(BaseModel):
     segundos_sin_reportar: int | None = None
     failover_events: int = 0
 
+    # ------------------------------------------------------------- v2 ------
+    agente_version: str | None = None
+    # Que sabe medir el nodo y que le pidio el servidor que mande. Viajan como
+    # texto separado por comas, igual que en la columna: el dashboard solo los
+    # muestra, y una lista de cuatro palabras no justifica una tabla aparte.
+    capacidades: str | None = None
+    recursos_pedidos: str | None = None
+
+    # "Se desconecto de la red el ...". Sin esto el dashboard solo podia decir
+    # que un nodo no reporta, nunca desde cuando ni por que.
+    ultima_desconexion: datetime | None = None
+    motivo_desconexion: str | None = None
+    ultima_reconexion: datetime | None = None
+
+    # Un nodo que se cae y vuelve no es lo mismo que uno caido.
+    intermitente: bool = False
+    caidas_recientes: int = 0
+
+    # Estado de la sincronizacion: cuantas muestras trae guardadas sin entregar
+    # y hasta que numero de muestra confirmo el servidor.
+    pendientes_sync: int = 0
+    ultima_seq: int = 0
+
+    # Cuanto miente el reloj del nodo. La metrica se guarda con la hora del
+    # servidor igual; esto es para que el operador lo sepa.
+    desvio_reloj_seg: float | None = None
+
+    # VIVO o SYNC: si el ultimo dato llego en tiempo real o se recupero del
+    # buffer del cliente despues de una caida. No son lo mismo y el dashboard
+    # los distingue.
+    origen_ultima_metrica: str | None = None
+
+    recursos_activos: int = 0
+    # Capacidad de los discos ADICIONALES (el pendrive de Santa Cruz). No entra
+    # en total_gb porque el enunciado define esa columna como el primer disco.
+    extra_disco_gb: float = 0.0
+
 
 class ClusterOut(BaseModel):
     nodos_totales: int
@@ -55,6 +95,11 @@ class ClusterOut(BaseModel):
     libre_total_gb: float
     uso_pct_global: float | None = None
     latencia_ponderada_ms: float | None = None
+    # v2
+    nodos_intermitentes: int = 0
+    regionales: int = 0
+    capacidad_con_extras_gb: float = 0.0
+    extras_gb: float = 0.0
 
 
 class PuntoHistorial(BaseModel):
@@ -128,3 +173,93 @@ class RespuestaComando(BaseModel):
     cmd_id: str
     estado: str
     detalle: str
+
+
+# ------------------------------------------------------------------- v2 -----
+
+class RecursoOut(BaseModel):
+    """
+    Un recurso medido: un disco, la RAM, la CPU, una interfaz de red.
+
+    `metricas` es un diccionario ABIERTO a proposito. Es lo que hace que
+    agregar una medida nueva no obligue a tocar este archivo, ni el dashboard,
+    ni la base: el cliente manda una clave mas y aparece sola.
+    """
+    node_id: str
+    tipo: str                                    # DISCO | RAM | CPU | RED | CUSTOM
+    nombre: str
+    timestamp: datetime
+    metricas: dict[str, float] = Field(default_factory=dict)
+    etiquetas: dict[str, str] = Field(default_factory=dict)
+    origen: str = "VIVO"
+    total_gb: float | None = None
+    usado_gb: float | None = None
+    uso_pct: float | None = None
+
+
+class PuntoRecurso(BaseModel):
+    timestamp: datetime
+    total_gb: float | None = None
+    usado_gb: float | None = None
+    uso_pct: float | None = None
+    origen: str = "VIVO"
+
+
+class HistorialRecursoOut(BaseModel):
+    node_id: str
+    tipo: str
+    nombre: str
+    horas: int
+    puntos: list[PuntoRecurso]
+
+
+class RegionalOut(BaseModel):
+    """
+    Consolidado por REGIONAL, no por maquina.
+
+    Existe porque La Paz tiene dos servidores: el enunciado habla de nueve
+    administraciones regionales, no de nueve computadoras.
+    """
+    region: str
+    sedes: str | None = None
+    nodos: int
+    nodos_activos: int
+    capacidad_total_gb: float
+    usado_total_gb: float
+    libre_total_gb: float
+    uso_pct: float | None = None
+    ultimo_reporte: datetime | None = None
+
+
+class SetRecursosIn(BaseModel):
+    """Que debe medir un nodo. Se valida contra la lista de colectores que
+    existen de verdad: un nombre inventado se rechaza con 422, en vez de
+    dejar al nodo callado sin que nadie entienda por que."""
+    recursos: list[str] = Field(..., min_length=1, max_length=16,
+                                examples=[["disco", "ram", "cpu"]])
+
+
+class PuntoCluster(BaseModel):
+    t: datetime
+    usado_gb: float
+    total_gb: float
+    uso_pct: float
+    nodos: int
+
+
+class HistorialClusterOut(BaseModel):
+    """
+    Utilizacion global en el tiempo: UNA serie, no una por nodo.
+
+    Diez lineas en un mismo grafico no se leen. El total va aqui; cada nodo
+    tiene su mini-linea dentro de su tarjeta.
+    """
+    horas: int
+    puntos: list[PuntoCluster]
+
+
+class TramoUso(BaseModel):
+    desde: int
+    hasta: int
+    nodos: int
+    node_ids: list[str] = Field(default_factory=list)
