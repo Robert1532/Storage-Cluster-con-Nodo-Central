@@ -9,7 +9,7 @@ Comprueba, en orden, las cuatro cosas que pueden fallar:
   2. TCP: que el puerto este abierto desde esta red (los laboratorios y
      algunas redes de universidad bloquean puertos altos de salida)
   3. TLS + credenciales: que el ca.pem y la contrasena sean correctos
-  4. Esquema: que las 4 tablas y las 3 vistas ya existan
+  4. Esquema: que las 5 tablas y las 5 vistas ya existan (v2)
 
 Si el paso 2 falla en el aula el dia de la defensa, no hay demo contra Aiven:
 por eso desde el dia 6 se trabaja contra MySQL local. Ver el documento del
@@ -84,18 +84,20 @@ def main() -> int:
         cur.execute("SHOW TABLES")
         hay = {list(f.values())[0] for f in cur.fetchall()}
 
-    faltan = [n for n in ("nodos", "metricas", "eventos", "mensajes",
-                          "v_ultima_metrica", "v_nodos_estado", "v_cluster")
+    faltan = [n for n in ("nodos", "metricas", "eventos", "mensajes", "recursos",
+                          "v_ultima_metrica", "v_nodos_estado", "v_cluster",
+                          "v_recursos_ultimo", "v_regionales")
               if n not in hay]
     if faltan:
         print(f"      Faltan: {', '.join(faltan)}")
-        print("      Corre el esquema:")
+        print("      Si la base esta vacia, corre el esquema completo;")
+        print("      si ya tenia datos de la v1, corre db/migracion_v2.sql.")
         print(f"        mysql --host={config.DB_HOST} --port={config.DB_PORT} \\")
         print(f"              --user={config.DB_USER} --password \\")
         print(f"              --ssl-ca=db/ca.pem {config.DB_NAME} < db/schema.sql")
         return 1
 
-    print("      OK -> las 4 tablas y las 3 vistas estan creadas")
+    print("      OK -> las 5 tablas y las 5 vistas estan creadas")
     print("\n" + "=" * 66)
     print(" TODO EN ORDEN. Ahora podes correr:  python -m db.probar_bd")
     print("=" * 66)

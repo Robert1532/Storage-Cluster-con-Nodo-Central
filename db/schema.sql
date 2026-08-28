@@ -1,6 +1,6 @@
 -- ============================================================================
---  Practica 1 - Storage Cluster CNS
---  Esquema MySQL 8.0  ·  Responsable: Robert (Datos)
+--  Practica 1 - Storage Cluster CNS   ·   ESQUEMA v2
+--  MySQL 8.0  ·  Responsable: Robert (Datos)
 --
 --  Este archivo crea SOLO las tablas y las vistas. Funciona igual en Aiven y
 --  en un MySQL local, porque no crea la base ni el usuario.
@@ -18,6 +18,23 @@
 --  cuantas veces haga falta, pero se lleva por delante todos los datos. Contra
 --  la base compartida de Aiven, correrlo destruye el trabajo de los otros
 --  cuatro: avisen en el grupo antes.
+--
+--  SI YA TIENEN DATOS Y NO QUIEREN PERDERLOS: usen db/migracion_v2.sql, que
+--  agrega lo nuevo de la version 2 sin borrar nada.
+--
+--  QUE TRAE LA VERSION 2
+--  ---------------------
+--    * tabla `recursos`: metricas de CUALQUIER cosa (RAM, CPU, red, discos
+--      adicionales como el pendrive de Santa Cruz) sin cambiar el esquema.
+--    * `metricas.seq` + `nodos.ultima_seq`: la sincronizacion tras una caida
+--      no puede insertar la misma muestra dos veces.
+--    * `metricas.origen`: distingue el dato que llego en vivo del que llego
+--      recuperado del buffer del cliente.
+--    * `nodos.ultima_desconexion` / `motivo_desconexion`: el dashboard puede
+--      decir "se desconecto de la red el ...", que antes se perdia.
+--    * `nodos.intermitente`: un nodo que va y viene es un problema distinto a
+--      uno que se cayo y ya.
+--    * `nodos.desvio_reloj_seg`: cuanto miente el reloj de ese nodo.
 -- ============================================================================
 
 -- Todo el sistema trabaja en UTC. Esto importa tambien aqui: las columnas con
@@ -27,10 +44,13 @@
 SET time_zone = '+00:00';
 
 DROP VIEW  IF EXISTS v_cluster;
+DROP VIEW  IF EXISTS v_regionales;
 DROP VIEW  IF EXISTS v_nodos_estado;
 DROP VIEW  IF EXISTS v_ultima_metrica;
+DROP VIEW  IF EXISTS v_recursos_ultimo;
 DROP TABLE IF EXISTS mensajes;
 DROP TABLE IF EXISTS eventos;
+DROP TABLE IF EXISTS recursos;
 DROP TABLE IF EXISTS metricas;
 DROP TABLE IF EXISTS nodos;
 
@@ -38,11 +58,20 @@ DROP TABLE IF EXISTS nodos;
 -- ----------------------------------------------------------------------------
 -- 1. nodos  ·  catalogo: quien existe en el cluster
 --    Una fila por servidor regional. Aqui vive el ESTADO ACTUAL.
+--
+--    OJO: la REGION NO ES LA IDENTIDAD. La Paz tiene dos servidores
+--    (CNS-LPZ-01 y CNS-LPZ-10) y las dos filas dicen region='La Paz'. Lo unico
+--    unico es node_id. Por eso uq_node_id esta sobre node_id y NO sobre region.
 -- ----------------------------------------------------------------------------
 CREATE TABLE nodos (
   id                 INT UNSIGNED NOT NULL AUTO_INCREMENT,
   node_id            VARCHAR(32)  NOT NULL,
+  -- region = DEPARTAMENTO (hay nueve: las administraciones regionales del
+  -- enunciado). sede = la oficina concreta donde esta el servidor. El
+  -- departamento de La Paz tiene dos sedes con servidor propio: La Paz y El
+  -- Alto. Se agrupa por region; se distingue por sede.
   region             VARCHAR(64)  NOT NULL,
+  sede               VARCHAR(64)  NULL,
   hostname           VARCHAR(128) NULL,
   sistema_operativo  VARCHAR(64)  NULL,
   ip                 VARCHAR(45)  NULL,              -- 45 = cabe IPv6
@@ -50,9 +79,37 @@ CREATE TABLE nodos (
   ultimo_reporte     DATETIME(3)  NULL,
   estado             ENUM('ACTIVO','NO_REPORTA') NOT NULL DEFAULT 'ACTIVO',
   intervalo_seg      SMALLINT UNSIGNED NOT NULL DEFAULT 10,
+
+  -- ---------------------------------------------------------------- v2 ------
+  agente_version     VARCHAR(32)  NULL,              -- version del cliente
+  capacidades        VARCHAR(255) NULL,              -- que sabe medir el nodo
+  recursos_pedidos   VARCHAR(255) NULL,              -- que le pide el servidor
+
+  -- "Se desconecto de la red el ...". Antes esta informacion solo existia en
+  -- la tabla eventos y el dashboard no la mostraba en ningun lado.
+  ultima_desconexion DATETIME(3)  NULL,
+  motivo_desconexion VARCHAR(255) NULL,
+  ultima_reconexion  DATETIME(3)  NULL,
+
+  -- Un nodo que se cae y vuelve cinco veces en diez minutos no esta "activo":
+  -- esta fallando de forma intermitente, y es lo que hay que mirar primero.
+  intermitente       TINYINT(1)   NOT NULL DEFAULT 0,
+  caidas_recientes   SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+
+  -- Ultimo numero de muestra aceptado. Es lo que hace idempotente la
+  -- sincronizacion: si el cliente reenvia un lote porque no le llego el
+  -- SYNC_OK, todo lo que sea <= a esto se descarta en vez de duplicarse.
+  ultima_seq         BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  pendientes_sync    INT UNSIGNED NOT NULL DEFAULT 0,
+
+  -- Cuanto miente el reloj de ese nodo respecto al del servidor, en segundos.
+  -- Informativo: la hora de las metricas la pone el servidor igual.
+  desvio_reloj_seg   DECIMAL(12,3) NULL,
+
   PRIMARY KEY (id),
   UNIQUE KEY uq_node_id (node_id),                   -- el alta automatica depende de esto
   KEY ix_estado (estado),
+  KEY ix_region (region),                            -- agrupacion por regional
   KEY ix_ultimo_reporte (ultimo_reporte),            -- lo lee el watchdog
   -- Un intervalo de 0 haria que el watchdog marque NO_REPORTA un segundo
   -- despues de cada reporte, para siempre.
@@ -64,15 +121,19 @@ CREATE TABLE nodos (
 
 
 -- ----------------------------------------------------------------------------
--- 2. metricas  ·  historico: una fila por reporte, nunca se sobrescribe
+-- 2. metricas  ·  historico del PRIMER disco: una fila por reporte
+--    Es la tabla que exige el enunciado ("solo se reporta el primer disco") y
+--    la que alimenta v_cluster y el dashboard. Los discos ADICIONALES, la RAM
+--    y la CPU van en `recursos`.
+--
 --    9 nodos x 1 reporte cada 10 s = ~78.000 filas/dia. Por eso los indices.
 -- ----------------------------------------------------------------------------
 CREATE TABLE metricas (
   id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   node_id         VARCHAR(32)  NOT NULL,
-  timestamp       DATETIME(3)  NOT NULL,
+  timestamp       DATETIME(3)  NOT NULL,             -- LA PONE EL SERVIDOR
   disco_nombre    VARCHAR(64)  NULL,
-  disco_tipo      ENUM('SSD','HDD','DESCONOCIDO') NOT NULL DEFAULT 'DESCONOCIDO',
+  disco_tipo      ENUM('SSD','HDD','USB','DESCONOCIDO') NOT NULL DEFAULT 'DESCONOCIDO',
   total_gb        DECIMAL(10,2) NOT NULL,
   usado_gb        DECIMAL(10,2) NOT NULL,
   libre_gb        DECIMAL(10,2) NOT NULL,
@@ -80,6 +141,19 @@ CREATE TABLE metricas (
   iops_lectura    INT UNSIGNED  NOT NULL DEFAULT 0,
   iops_escritura  INT UNSIGNED  NOT NULL DEFAULT 0,
   latencia_ms     DECIMAL(8,3)  NOT NULL DEFAULT 0,
+
+  -- ---------------------------------------------------------------- v2 ------
+  -- Numero de muestra del cliente. Crece siempre y sobrevive a un reinicio
+  -- del cliente porque vive en su base local SQLite.
+  seq             BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  -- VIVO: llego en el momento.  SYNC: se recupero del buffer del cliente
+  -- despues de una caida de red. En el dashboard se distinguen a proposito:
+  -- un hueco relleno no es lo mismo que un dato de tiempo real.
+  origen          ENUM('VIVO','SYNC') NOT NULL DEFAULT 'VIVO',
+  -- Hora que decia el reloj DEL CLIENTE. Solo para auditoria: si no coincide
+  -- con `timestamp`, ese nodo tiene la hora cambiada.
+  t_cliente       DATETIME(3)  NULL,
+
   PRIMARY KEY (id),
   KEY ix_nodo_tiempo (node_id, timestamp DESC, id DESC),  -- ultima metrica de un
                                                      -- nodo (el id desempata) y
@@ -87,6 +161,7 @@ CREATE TABLE metricas (
   KEY ix_tiempo (timestamp),                         -- consultas por ventana de
                                                      -- tiempo SIN filtrar nodo
                                                      -- (growth rate global)
+  KEY ix_nodo_seq (node_id, seq),                    -- control de duplicados
   CONSTRAINT fk_metricas_nodo FOREIGN KEY (node_id)
       REFERENCES nodos (node_id) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -97,7 +172,60 @@ CREATE TABLE metricas (
 
 
 -- ----------------------------------------------------------------------------
--- 3. eventos  ·  bitacora: que le paso a cada nodo y cuando
+-- 3. recursos  ·  LA TABLA FLEXIBLE (v2)
+--
+--    Aqui entra cualquier cosa que un nodo sepa medir y que no sea el primer
+--    disco: la RAM, la CPU, las interfaces de red, y los discos adicionales
+--    (el pendrive que alguien enchufa en la laptop de Santa Cruz).
+--
+--    POR QUE JSON Y NO UNA COLUMNA POR METRICA
+--    Porque el objetivo es que agregar una medida nueva NO obligue a un ALTER
+--    TABLE ni a coordinar a cinco personas. El cliente manda
+--    {"total_gb": 16, "usado_gb": 9.2, "uso_pct": 57.5} y se guarda entero.
+--    Manana manda ademas {"temperatura_c": 41} y tambien se guarda.
+--
+--    POR QUE ADEMAS HAY COLUMNAS GENERADAS
+--    Porque consultar JSON en cada fila es lento y no se indexa. Las tres
+--    medidas que SI se consultan siempre (total, usado, %) se extraen a
+--    columnas STORED calculadas por MySQL a partir del JSON: se escriben
+--    solas, no se pueden desincronizar del JSON, y SI se indexan. Se paga
+--    espacio y se gana orden de magnitud en las consultas del dashboard.
+--    Es el patron "JSON con columnas materializadas" y es una buena respuesta
+--    si en la defensa preguntan por que no se hizo una tabla clave-valor.
+-- ----------------------------------------------------------------------------
+CREATE TABLE recursos (
+  id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  node_id    VARCHAR(32) NOT NULL,
+  timestamp  DATETIME(3) NOT NULL,                   -- LA PONE EL SERVIDOR
+  tipo       ENUM('DISCO','RAM','CPU','RED','CUSTOM') NOT NULL DEFAULT 'CUSTOM',
+  nombre     VARCHAR(64) NOT NULL,                   -- 'C:\\', 'fisica', 'eth0'
+  metricas   JSON NOT NULL,                          -- solo numeros
+  etiquetas  JSON NULL,                              -- texto descriptivo
+  origen     ENUM('VIVO','SYNC') NOT NULL DEFAULT 'VIVO',
+  seq        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+
+  -- Columnas materializadas desde el JSON. NULL si ese recurso no reporta esa
+  -- medida (la CPU no tiene total_gb, y esta bien que sea NULL).
+  total_gb   DECIMAL(12,2) GENERATED ALWAYS AS
+             (JSON_VALUE(metricas, '$.total_gb' RETURNING DECIMAL(12,2) NULL ON EMPTY NULL ON ERROR)) STORED,
+  usado_gb   DECIMAL(12,2) GENERATED ALWAYS AS
+             (JSON_VALUE(metricas, '$.usado_gb' RETURNING DECIMAL(12,2) NULL ON EMPTY NULL ON ERROR)) STORED,
+  uso_pct    DECIMAL(6,2)  GENERATED ALWAYS AS
+             (JSON_VALUE(metricas, '$.uso_pct' RETURNING DECIMAL(6,2) NULL ON EMPTY NULL ON ERROR)) STORED,
+
+  PRIMARY KEY (id),
+  -- El indice lleva el nombre del recurso porque la consulta tipica es
+  -- "la ultima medicion de la RAM del nodo X", no "todas las de la RAM".
+  KEY ix_nodo_recurso_tiempo (node_id, tipo, nombre, timestamp DESC, id DESC),
+  KEY ix_tiempo (timestamp),
+  KEY ix_uso (tipo, uso_pct),
+  CONSTRAINT fk_recursos_nodo FOREIGN KEY (node_id)
+      REFERENCES nodos (node_id) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+
+-- ----------------------------------------------------------------------------
+-- 4. eventos  ·  bitacora: que le paso a cada nodo y cuando
 --    De aqui salen los failover events y la disponibilidad.
 -- ----------------------------------------------------------------------------
 CREATE TABLE eventos (
@@ -105,7 +233,16 @@ CREATE TABLE eventos (
   node_id    VARCHAR(32) NOT NULL,
   timestamp  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   tipo       ENUM('CONEXION','DESCONEXION','ALTA_AUTOMATICA',
-                  'NO_REPORTA','RECUPERADO','CAMBIO_INTERVALO') NOT NULL,
+                  'NO_REPORTA','RECUPERADO','CAMBIO_INTERVALO',
+                  -- v2:
+                  'SINCRONIZACION',     -- llego un lote de datos atrasados
+                  'RELOJ_DESVIADO',     -- ese nodo tiene la hora cambiada
+                  'INTERMITENTE',       -- se cae y vuelve una y otra vez
+                  'DISCO_AGREGADO',     -- enchufaron un pendrive / disco nuevo
+                  'DISCO_REMOVIDO',     -- lo sacaron
+                  'CAPACIDAD_CAMBIADA', -- el disco crecio o encogio
+                  'CAMBIO_RECURSOS'     -- se le pidio medir otra cosa
+                 ) NOT NULL,
   detalle    VARCHAR(255) NULL,
   PRIMARY KEY (id),
   KEY ix_nodo_tiempo (node_id, timestamp DESC),
@@ -118,7 +255,7 @@ CREATE TABLE eventos (
 
 
 -- ----------------------------------------------------------------------------
--- 4. mensajes  ·  canal de vuelta servidor -> cliente, con su confirmacion
+-- 5. mensajes  ·  canal de vuelta servidor -> cliente, con su confirmacion
 --
 --    OJO, ESTA TABLA ES TAMBIEN EL BUS ENTRE LA API Y EL SERVIDOR DE SOCKETS.
 --    La API (FastAPI) y el servidor de sockets son DOS PROCESOS distintos y no
@@ -133,7 +270,9 @@ CREATE TABLE mensajes (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   cmd_id      VARCHAR(36) NOT NULL,                  -- UUID: empareja el ACK
   node_id     VARCHAR(32) NOT NULL,
-  accion      ENUM('MENSAJE','SET_INTERVAL') NOT NULL DEFAULT 'MENSAJE',
+  accion      ENUM('MENSAJE','SET_INTERVAL',
+                   'SET_RECURSOS','PING','SOLICITAR_SYNC')
+                 NOT NULL DEFAULT 'MENSAJE',
   texto       VARCHAR(255) NULL,
   valor       INT NULL,                              -- para SET_INTERVAL
   estado      ENUM('PENDIENTE','ENVIADO','CONFIRMADO','FALLIDO')
@@ -183,7 +322,8 @@ CREATE TABLE mensajes (
 CREATE OR REPLACE VIEW v_ultima_metrica AS
 SELECT m.id, m.node_id, m.timestamp, m.disco_nombre, m.disco_tipo,
        m.total_gb, m.usado_gb, m.libre_gb, m.uso_pct,
-       m.iops_lectura, m.iops_escritura, m.latencia_ms
+       m.iops_lectura, m.iops_escritura, m.latencia_ms,
+       m.origen, m.seq, m.t_cliente
 FROM nodos n
 JOIN metricas m
   ON m.id = (SELECT x.id
@@ -193,12 +333,30 @@ JOIN metricas m
               LIMIT 1);
 
 
+-- Ultima medicion de CADA recurso de cada nodo (v2).
+-- Mismo truco que arriba: se arranca desde la lista de recursos distintos y se
+-- busca el id mas reciente de cada uno por indice, en vez de recorrer todo.
+CREATE OR REPLACE VIEW v_recursos_ultimo AS
+SELECT r.id, r.node_id, r.tipo, r.nombre, r.timestamp,
+       r.metricas, r.etiquetas, r.origen,
+       r.total_gb, r.usado_gb, r.uso_pct
+FROM recursos r
+WHERE r.id = (SELECT x.id
+                FROM recursos x
+               WHERE x.node_id = r.node_id
+                 AND x.tipo    = r.tipo
+                 AND x.nombre  = r.nombre
+               ORDER BY x.timestamp DESC, x.id DESC
+               LIMIT 1);
+
+
 -- Estado completo de cada nodo: catalogo + su ultima medicion.
 -- Es lo que consume GET /api/nodes casi tal cual.
 CREATE OR REPLACE VIEW v_nodos_estado AS
 SELECT
     n.node_id,
     n.region,
+    n.sede,
     n.hostname,
     n.sistema_operativo,
     n.ip,
@@ -206,6 +364,17 @@ SELECT
     n.intervalo_seg,
     n.primer_registro,
     n.ultimo_reporte,
+    n.agente_version,
+    n.capacidades,
+    n.recursos_pedidos,
+    n.ultima_desconexion,
+    n.motivo_desconexion,
+    n.ultima_reconexion,
+    n.intermitente,
+    n.caidas_recientes,
+    n.ultima_seq,
+    n.pendientes_sync,
+    n.desvio_reloj_seg,
     um.disco_nombre,
     um.disco_tipo,
     um.total_gb,
@@ -215,9 +384,19 @@ SELECT
     um.iops_lectura,
     um.iops_escritura,
     um.latencia_ms,
+    um.origen                                        AS origen_ultima_metrica,
     TIMESTAMPDIFF(SECOND, n.ultimo_reporte, NOW()) AS segundos_sin_reportar,
     (SELECT COUNT(*) FROM eventos e
-      WHERE e.node_id = n.node_id AND e.tipo = 'NO_REPORTA') AS failover_events
+      WHERE e.node_id = n.node_id AND e.tipo = 'NO_REPORTA') AS failover_events,
+    -- Cuantos recursos extra (RAM, CPU, otros discos) esta reportando hoy.
+    (SELECT COUNT(*) FROM v_recursos_ultimo vr
+      WHERE vr.node_id = n.node_id)                          AS recursos_activos,
+    -- Capacidad TOTAL de almacenamiento del nodo contando los discos
+    -- adicionales. El pendrive de Santa Cruz suma aqui, no en total_gb, que
+    -- por definicion del enunciado es solo el primer disco.
+    COALESCE((SELECT SUM(vr.total_gb) FROM v_recursos_ultimo vr
+               WHERE vr.node_id = n.node_id AND vr.tipo = 'DISCO'), 0)
+                                                             AS extra_disco_gb
 FROM nodos n
 LEFT JOIN v_ultima_metrica um ON um.node_id = n.node_id;
 
@@ -228,6 +407,8 @@ CREATE OR REPLACE VIEW v_cluster AS
 SELECT
     (SELECT COUNT(*) FROM nodos)                              AS nodos_totales,
     (SELECT COUNT(*) FROM nodos WHERE estado = 'ACTIVO')      AS nodos_activos,
+    (SELECT COUNT(*) FROM nodos WHERE intermitente = 1)       AS nodos_intermitentes,
+    (SELECT COUNT(DISTINCT region) FROM nodos)                AS regionales,
     COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN total_gb END), 0) AS capacidad_total_gb,
     COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN usado_gb END), 0) AS usado_total_gb,
     COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN libre_gb END), 0) AS libre_total_gb,
@@ -238,9 +419,36 @@ SELECT
     ROUND(
       COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN latencia_ms * total_gb END), 0) /
       NULLIF(SUM(CASE WHEN estado='ACTIVO' THEN total_gb END), 0)
-    , 3)                                                      AS latencia_ponderada_ms
+    , 3)                                                      AS latencia_ponderada_ms,
+    -- v2: capacidad contando discos adicionales (pendrives, discos externos).
+    COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN total_gb + extra_disco_gb END), 0)
+                                                              AS capacidad_con_extras_gb,
+    COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN extra_disco_gb END), 0)
+                                                              AS extras_gb
 FROM v_nodos_estado;
 
 -- NULLIF evita la division por cero cuando todavia no reporto nadie.
 -- Si les preguntan "que pasa si arrancan con cero nodos", la respuesta esta aca:
 -- devuelve una fila con ceros y NULL, no un error.
+
+
+-- Consolidado POR REGIONAL (v2).
+-- Existe porque La Paz tiene dos servidores: el enunciado habla de nueve
+-- administraciones regionales, no de nueve maquinas. Esta vista responde
+-- "cuanto almacenamiento tiene la regional La Paz" sumando sus dos nodos.
+CREATE OR REPLACE VIEW v_regionales AS
+SELECT
+    region,
+    COUNT(*)                                                  AS nodos,
+    GROUP_CONCAT(sede ORDER BY sede SEPARATOR ' · ')          AS sedes,
+    SUM(estado = 'ACTIVO')                                    AS nodos_activos,
+    COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN total_gb END), 0) AS capacidad_total_gb,
+    COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN usado_gb END), 0) AS usado_total_gb,
+    COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN libre_gb END), 0) AS libre_total_gb,
+    ROUND(
+      COALESCE(SUM(CASE WHEN estado='ACTIVO' THEN usado_gb END), 0) /
+      NULLIF(SUM(CASE WHEN estado='ACTIVO' THEN total_gb END), 0) * 100
+    , 2)                                                      AS uso_pct,
+    MAX(ultimo_reporte)                                       AS ultimo_reporte
+FROM v_nodos_estado
+GROUP BY region;

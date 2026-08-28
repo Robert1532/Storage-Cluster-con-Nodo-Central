@@ -1,0 +1,14 @@
+# Todo el repositorio se guarda con finales de linea LF.
+#
+# Por que existe este archivo: el arbol de trabajo se habia pasado a CRLF en
+# alguna maquina Windows, mientras que lo commiteado estaba en LF. Consecuencia:
+# `git status` mostraba como modificados archivos que nadie habia tocado, y
+# cualquier PR arrastraba diffs de cientos de lineas donde el cambio real eran
+# tres. Con esto, Git normaliza al guardar y el problema no vuelve.
+* text=auto eol=lf
+
+# Binarios: que Git no los toque.
+*.png binary
+*.pdf binary
+*.docx binary
+*.db  binary

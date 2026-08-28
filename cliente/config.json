@@ -1,7 +1,9 @@
 {
   "node_id": "CNS-LPZ-01",
   "region": "La Paz",
+  "sede": "La Paz",
   "host": "127.0.0.1",
   "puerto": 5050,
-  "intervalo": 5
+  "intervalo": 5,
+  "recursos": ["disco", "discos", "ram", "cpu"]
 }

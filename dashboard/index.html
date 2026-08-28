@@ -3,620 +3,1318 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Storage Cluster CNS</title>
+<title>Storage Cluster · Caja Nacional de Salud</title>
 <!--
-  Dashboard — modulo M4.  Responsable: Alex.
+  Dashboard — modulo M4 (v2.1).  Responsable: Alex.
 
-  ESQUELETO FUNCIONAL: ya consume la API y pinta la tabla, los KPIs y el
-  auto-refresh. Lo que falta esta marcado con TODO Alex.
+  QUE PREGUNTA RESPONDE CADA COSA, DE ARRIBA HACIA ABAJO
+  ------------------------------------------------------
+  1. Cabecera .... "cuanto hay y cuanto queda" — cuatro numeros y nada mas.
+  2. Alertas ..... "hay algo que atender AHORA" — solo aparece si lo hay.
+  3. Ranking ..... "que nodo esta mas lleno" — barras ordenadas, verde/ambar/rojo.
+  4. Histograma .. "esta el cluster equilibrado o hay pocos llenos y muchos vacios"
+  5. Departamentos "cuanta capacidad tiene cada regional" — barras apiladas.
+  6. Historico ... "esta subiendo el uso" — UNA linea, la del cluster.
+  7. Tarjetas .... el detalle de cada servidor, agrupado por departamento.
+  8. Recursos ... RAM, CPU, red y discos extra.
+  9. Bitacora ... que paso y cuando.
+
+  DECISIONES DE VISUALIZACION (y por que)
+  ---------------------------------------
+  * EL COLOR SIGNIFICA ESTADO, NO IDENTIDAD. Verde / ambar / rojo con los
+    mismos cortes (80% y 90%) en TODA la pantalla: las barras, las tarjetas,
+    el medidor. Si algo esta rojo, esta lleno; no hay que aprender una leyenda.
+    El numero siempre esta escrito al lado — el color nunca es el unico dato,
+    que es lo que hace que la pantalla siga sirviendo para alguien daltonico.
+
+  * EL HISTORICO ES UNA SOLA LINEA. Antes era una por nodo: con diez nodos eso
+    es un plato de espaguetis donde los colores dejan de distinguirse y la
+    pregunta "esta subiendo el uso del cluster?" no se lee. El total va en el
+    grafico grande; cada nodo tiene su mini-linea dentro de su tarjeta.
+
+  * NO HAY DOS COSAS QUE DIGAN LO MISMO. La version anterior tenia un donut en
+    la cabecera y un medidor abajo mostrando el mismo porcentaje.
+
+  * SIN F5. La API empuja el estado por WebSocket. Si el socket no se puede
+    abrir, el dashboard vuelve solo al polling REST y el indicador de arriba lo
+    dice. Una pantalla congelada que parece actualizada es peor que una que avisa.
+
   Se sirve desde la misma API: http://IP:8000
 -->
 <style>
   :root{
-    --bg:#0f1319; --card:#171d26; --line:#28313d;
-    --txt:#e6ebf2; --soft:#93a0b1;
-    --ok:#3ec98a; --mal:#ef6a58; --warn:#e6b23c; --acc:#3fb8b0;
+    /* --- superficies e ink --- */
+    --bg:#0e1217; --card:#161c25; --card2:#1b2230; --line:#28313d;
+    --txt:#e8edf3; --soft:#94a1b2; --tenue:#6b7787;
+
+    /* --- ESTADO (paleta fija, validada sobre esta superficie oscura) ---
+       Los mismos cuatro colores en toda la pantalla. Nunca se usan para
+       identificar un nodo: solo para decir en que estado esta. */
+    --ok:#0ca30c; --warn:#fab219; --grave:#ec835a; --mal:#d03b3b;
+
+    /* --- SERIE (identidad) --- azul del slot 1, para las series que no son
+       un estado: el historico del cluster y el histograma. */
+    --serie:#3987e5; --serie-suave:rgba(57,135,229,.16);
+
+    /* --- cromo de la interfaz (botones, foco). No es dato. --- */
+    --acc:#3fb8b0;
+    --sync:#7d8ff0;
   }
   *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
   body{margin:0;background:var(--bg);color:var(--txt);
-       font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-  header{padding:20px 24px;border-bottom:1px solid var(--line);
-         display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
-  h1{margin:0;font-size:20px;letter-spacing:-.01em}
-  .ctrl{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--soft)}
-  select{background:var(--card);color:var(--txt);border:1px solid var(--line);
-         padding:6px 10px;border-radius:4px;font-size:13px}
-  main{padding:24px;max-width:1400px;margin:0 auto}
-  #aviso{display:none;background:rgba(239,106,88,.12);border:1px solid var(--mal);
-         color:var(--mal);padding:12px 16px;border-radius:6px;margin-bottom:20px;font-size:14px}
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
-  .kpi{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
-  .kpi span{display:block;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--soft)}
-  .kpi b{display:block;font-size:30px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
-  .kpi.grande b{font-size:40px;color:var(--acc)}
-  .tabla-wrap{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;background:var(--card);
-        border:1px solid var(--line);border-radius:6px;overflow:hidden;min-width:900px}
-  th{background:#1e2631;text-align:left;padding:11px 14px;font-size:11px;
-     letter-spacing:.08em;text-transform:uppercase;color:var(--soft);white-space:nowrap}
-  td{padding:11px 14px;border-top:1px solid var(--line);font-size:14px}
-  .pill{padding:3px 9px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
-  .pill.on{background:rgba(62,201,138,.15);color:var(--ok)}
-  .pill.off{background:rgba(239,106,88,.15);color:var(--mal)}
-  .barra{height:7px;background:#232c38;border-radius:99px;overflow:hidden;min-width:90px}
-  .barra i{display:block;height:100%;background:var(--ok)}
-  .barra i.medio{background:var(--warn)} .barra i.alto{background:var(--mal)}
-  .num{font-variant-numeric:tabular-nums;white-space:nowrap}
-  .caja{background:var(--card);border:1px solid var(--line);border-radius:6px;
-        padding:16px 18px;margin-top:24px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  input,button{background:#1e2631;color:var(--txt);border:1px solid var(--line);
-               padding:8px 12px;border-radius:4px;font-size:13px}
-  button{cursor:pointer;border-color:var(--acc);color:var(--acc)}
-  button:hover:not(:disabled){background:var(--acc);color:#0f1319}
-  button:disabled{opacity:.45;cursor:not-allowed}
-  #eco{font-size:12px;color:var(--soft);margin-left:auto}
-  #eco.error{color:var(--mal)}
+       font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .num{font-variant-numeric:tabular-nums}
 
-  header{align-items:center}
-  header{display:flex;align-items:center;gap:24px;flex-wrap:wrap}
-  header h1{margin-right:auto}
-  .header-refresh{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:11px;color:var(--soft)}
-  .header-refresh select{padding:5px 8px;font-size:12px}
-  .resumen{display:flex;gap:22px;font-size:12px;color:var(--soft)}
-  .resumen b{display:block;font-size:16px;color:var(--txt)}
-  .donut-wrap{position:relative;width:70px;height:70px}
-  .donut-txt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-  .donut-txt b{font-size:14px}
-  .donut-txt span{font-size:9px;color:var(--soft)}
+  /* ============================================================ CABECERA */
+  header{position:sticky;top:0;z-index:30;background:rgba(14,18,23,.94);
+         backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
+         padding:12px 22px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+  .marca{display:flex;align-items:center;gap:12px;margin-right:auto}
+  .marca .sigla{width:38px;height:38px;border-radius:50%;border:2px solid var(--acc);
+                display:flex;align-items:center;justify-content:center;
+                font-size:11px;font-weight:800;letter-spacing:.5px;color:var(--acc)}
+  .marca h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
+  .marca p{margin:0;font-size:11.5px;color:var(--soft)}
 
-  .tarjetas{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;margin-bottom:20px}
-  .tarjeta{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;cursor:pointer;transition:border-color .15s}
-  .tarjeta:hover{border-color:var(--acc)}
-  .tarjeta.caida{opacity:.55}
-  .t-region{font-weight:700;text-align:center;margin-bottom:6px}
-  .t-datos{font-size:11.5px;color:var(--soft);line-height:1.5;margin-bottom:8px}
-  .t-pct{font-size:12px;margin:6px 0;text-align:center}
-  .t-reporte{font-size:10.5px;color:var(--soft);margin-top:6px;text-align:center}
+  .kpis{display:flex;gap:26px;flex-wrap:wrap}
+  .kpi{min-width:78px}
+  .kpi > span{display:block;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+              color:var(--tenue);margin-bottom:1px}
+  .kpi b{font-size:19px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
+  .kpi.hero b{font-size:26px}
 
-  .tarjeta{position:relative}
-  .t-menu{position:absolute;top:8px;right:8px;background:none;border:none;color:var(--soft);
-          font-size:16px;line-height:1;padding:2px 6px;cursor:pointer;border-radius:4px}
-  .t-menu:hover{background:var(--line);color:var(--txt)}
+  .conexion{display:flex;flex-direction:column;align-items:flex-end;gap:2px;font-size:11px}
+  .senal{display:flex;align-items:center;gap:6px;font-weight:650;font-size:11.5px}
+  .senal i{width:8px;height:8px;border-radius:50%;background:var(--tenue)}
+  .senal.vivo i{background:var(--ok);animation:pulso 2s infinite}
+  .senal.rest i{background:var(--warn)} .senal.caido i{background:var(--mal)}
+  .senal.vivo{color:var(--ok)} .senal.rest{color:var(--warn)} .senal.caido{color:var(--mal)}
+  @keyframes pulso{0%{box-shadow:0 0 0 0 rgba(12,163,12,.5)}
+                   70%{box-shadow:0 0 0 7px rgba(12,163,12,0)}
+                   100%{box-shadow:0 0 0 0 rgba(12,163,12,0)}}
+  #ultima{color:var(--tenue)}
 
-  .modal-fondo{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);align-items:center;justify-content:center;z-index:50}
+  main{padding:20px 22px 60px;max-width:1560px;margin:0 auto}
+
+  @media(max-width:900px){
+    /* En un telefono la cabecera pegajosa con siete KPI se comia media
+       pantalla. Deja de ser pegajosa, los numeros se achican y los dos que
+       menos se miran se ocultan. */
+    header{position:static;padding:12px 14px;gap:12px}
+    .marca h1{font-size:15px} .marca p{display:none}
+    .kpis{gap:16px;flex:1 0 100%;order:3}
+    .kpi{min-width:0} .kpi b{font-size:16px} .kpi.hero b{font-size:22px}
+    .kpi.opcional{display:none}
+    .conexion{order:2}
+    #refresco{display:none}
+    main{padding:14px 12px 40px}
+    .panel{padding:13px 13px 11px}
+    .fila{grid-template-columns:104px 1fr 88px;gap:8px}
+    .fila .cifra{font-size:11.5px}
+    .ev{grid-template-columns:1fr;gap:1px;padding:8px 0}
+    .depto-tot{width:100%;margin-left:0}
+  }
+
+  /* ============================================================== PANELES */
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:10px;
+         padding:16px 18px 14px;margin-bottom:16px}
+  .panel-cab{display:flex;align-items:baseline;gap:12px;margin-bottom:4px;flex-wrap:wrap}
+  .panel-cab h2{margin:0;font-size:13.5px;font-weight:650;letter-spacing:-.005em}
+  .panel-cab .pregunta{font-size:11.5px;color:var(--tenue);margin-right:auto}
+  .panel-cab .dato{font-size:11.5px;color:var(--soft)}
+  .rejilla{display:grid;gap:16px;margin-bottom:16px;align-items:start}
+  @media(min-width:1100px){ .rejilla.dos{grid-template-columns:1.15fr .85fr} }
+
+  /* --------------------------------------------------------- leyenda */
+  .leyenda{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--soft);
+           margin-top:10px;padding-top:9px;border-top:1px solid var(--line)}
+  .leyenda span{display:flex;align-items:center;gap:5px}
+  .leyenda i{width:9px;height:9px;border-radius:2px;flex:none}
+
+  /* ------------------------------------------------------- alertas */
+  #alertas{margin-bottom:16px;display:grid;gap:8px}
+  @media(min-width:1100px){ #alertas{grid-template-columns:1fr 1fr} }
+  #alertas .alerta{margin-bottom:0}
+  #alertas .alerta.ancha{grid-column:1/-1}
+  .alerta{display:flex;align-items:flex-start;gap:10px;padding:10px 14px;
+          border-radius:8px;font-size:13px;margin-bottom:8px;border:1px solid}
+  .alerta b{font-weight:650}
+  .alerta.mal{background:rgba(208,59,59,.10);border-color:rgba(208,59,59,.45);color:#f2a9a9}
+  .alerta.warn{background:rgba(250,178,25,.09);border-color:rgba(250,178,25,.4);color:#f0cd7e}
+  .alerta.info{background:rgba(125,143,240,.10);border-color:rgba(125,143,240,.4);color:#b3bdf5}
+  .alerta .ico{font-size:14px;line-height:1.35;flex:none}
+  .alerta .nodos{color:inherit;opacity:.85}
+  .alerta.ok{background:rgba(12,163,12,.08);border-color:rgba(12,163,12,.35);color:#8fd68f}
+
+  /* -------------------------------------------------- barras horizontales */
+  .barras{display:flex;flex-direction:column;gap:7px;margin-top:12px}
+  .fila{display:grid;grid-template-columns:150px 1fr 116px;align-items:center;gap:12px;
+        cursor:pointer;padding:2px 4px;border-radius:6px;transition:background .12s}
+  .fila:hover{background:var(--card2)}
+  .fila .quien{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fila .quien small{display:block;font-size:10.5px;color:var(--tenue)}
+  .fila .pista{height:16px;background:#1f2733;border-radius:4px;overflow:hidden;position:relative}
+  .fila .pista i{display:block;height:100%;border-radius:0 4px 4px 0;transition:width .3s}
+  .fila .cifra{font-size:12.5px;text-align:right;color:var(--soft)}
+  .fila .cifra b{color:var(--txt);font-size:13.5px}
+  .fila.off .pista i{background:#3a4351 !important}
+  .fila.off .quien{color:var(--tenue)}
+
+  /* ------------------------------------------------------------ tarjetas */
+  .depto-cab{grid-column:1/-1;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+             padding:14px 0 8px;border-bottom:1px solid var(--line);margin-bottom:2px}
+  .depto-cab:first-child{padding-top:0}
+  .depto-cab h3{margin:0;font-size:15px;font-weight:650}
+  .chip{font-size:10.5px;color:var(--soft);background:var(--card2);
+        padding:2px 9px;border-radius:99px}
+  .depto-tot{margin-left:auto;display:flex;gap:18px;font-size:11.5px;color:var(--tenue);flex-wrap:wrap}
+  .depto-tot b{color:var(--txt);font-weight:600}
+
+  .tarjetas{display:grid;grid-template-columns:repeat(auto-fill,minmax(228px,1fr));gap:13px}
+  .tarjeta{background:var(--card);border:1px solid var(--line);border-radius:10px;
+           padding:14px 14px 12px;cursor:pointer;position:relative;
+           transition:border-color .15s,transform .15s}
+  .tarjeta:hover{border-color:var(--acc);transform:translateY(-1px)}
+  .tarjeta.off{opacity:.62;border-color:rgba(208,59,59,.35)}
+  .tarjeta .tope{display:flex;align-items:flex-start;gap:9px;margin-bottom:10px}
+  .tarjeta .disco{width:30px;height:30px;flex:none;opacity:.8}
+  .tarjeta .quien{flex:1;min-width:0}
+  .tarjeta .quien > b{display:block;font-size:14px;font-weight:650;line-height:1.25;
+                      overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tarjeta .quien > .dep{display:block;font-size:11.5px;font-weight:600;color:var(--soft);
+                         line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tarjeta .quien > small{display:block;font-size:10px;color:var(--tenue);
+                          overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .t-menu{background:none;border:none;color:var(--tenue);font-size:15px;line-height:1;
+          padding:2px 5px;cursor:pointer;border-radius:5px;flex:none}
+  .t-menu:hover{background:var(--card2);color:var(--txt)}
+  .t-cifras{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .t-pct{font-size:22px;font-weight:700;letter-spacing:-.02em}
+  .t-cap{font-size:11px;color:var(--soft);text-align:right;line-height:1.35}
+  .pista{height:8px;background:#1f2733;border-radius:99px;overflow:hidden}
+  .pista i{display:block;height:100%;transition:width .3s}
+  .t-spark{height:30px;margin:9px 0 4px}
+  .t-pie{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+         font-size:10.5px;color:var(--tenue);margin-top:6px}
+  .estado{padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700;
+          letter-spacing:.03em;white-space:nowrap}
+  .estado.on{background:rgba(12,163,12,.16);color:#4cc44c}
+  .estado.off{background:rgba(208,59,59,.16);color:#ec8080}
+  .tag{font-size:9.5px;padding:2px 7px;border-radius:99px;font-weight:700;letter-spacing:.03em}
+  .tag.sync{background:rgba(125,143,240,.18);color:#a3b0f2}
+  .tag.inter{background:rgba(250,178,25,.16);color:#e5ba63}
+  .tag.reloj{background:rgba(236,131,90,.16);color:#eda183}
+  .tag.usb{background:rgba(63,184,176,.16);color:var(--acc)}
+  .t-caida{font-size:10.5px;color:#e08f8f;margin-top:7px;line-height:1.45}
+
+  /* ------------------------------------------------------------- tablas */
+  .tabla-wrap{overflow-x:auto;margin-top:10px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:700px}
+  th{text-align:left;padding:7px 11px;font-size:10px;letter-spacing:.08em;
+     text-transform:uppercase;color:var(--tenue);white-space:nowrap;
+     border-bottom:1px solid var(--line)}
+  td{padding:7px 11px;border-top:1px solid var(--line);white-space:nowrap}
+  tbody tr:hover{background:var(--card2)}
+  .vacio{color:var(--tenue);font-size:12.5px;padding:16px 2px}
+
+  /* ----------------------------------------------------------- bitacora */
+  .ev{display:grid;grid-template-columns:130px 148px 1fr;gap:10px;font-size:12px;
+      padding:5px 0;border-top:1px solid var(--line);align-items:baseline}
+  .ev:first-child{border-top:none}
+  .ev time{color:var(--tenue)}
+  .ev b{font-weight:650;font-size:11px;letter-spacing:.02em}
+  .ev span{color:var(--soft);overflow:hidden;text-overflow:ellipsis}
+  .ev.malo b{color:#ec8080} .ev.bueno b{color:#4cc44c}
+  .ev.info b{color:#a3b0f2} .ev.aviso b{color:#e5ba63}
+
+  /* -------------------------------------------------------------- hover */
+  #globo{position:fixed;pointer-events:none;z-index:80;background:#0b0f14;
+         border:1px solid var(--line);border-radius:7px;padding:8px 11px;
+         font-size:12px;line-height:1.5;box-shadow:0 8px 26px rgba(0,0,0,.55);
+         display:none;max-width:260px}
+  #globo b{color:var(--txt)} #globo em{font-style:normal;color:var(--tenue)}
+
+  /* ------------------------------------------------------------- modales */
+  .modal-fondo{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);
+               align-items:center;justify-content:center;z-index:60;padding:18px}
   .modal-fondo.visible{display:flex}
-  .modal-caja{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:20px;width:320px}
-  .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-  .modal-x{background:none;border:none;color:var(--soft);font-size:16px;cursor:pointer;padding:2px 6px}
-  .modal-campo{display:block;font-size:12px;color:var(--soft);margin-bottom:12px}
-  .modal-campo select{width:100%;margin-top:4px}
-  .modal-acciones{display:flex;align-items:center;gap:10px}
-
-  .grafico-panel{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px;margin-bottom:24px}
-  .grafico-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-  .grafico-header strong{font-size:13px}
-  #historial-info{font-size:11px;color:var(--soft)}
-  .grafico-leyenda{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px}
-  .leyenda-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--soft)}
-  .leyenda-item i{width:9px;height:9px;border-radius:2px;display:inline-block}
-
-  .paneles-grafico{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}
-  .paneles-grafico .grafico-panel{margin-bottom:0}
-  .grafico-lineas{flex:2;min-width:340px}
-  .grafico-gauge{flex:1;min-width:230px;display:flex;flex-direction:column;align-items:center}
-  .gauge-metrics{display:flex;gap:16px;font-size:11px;color:var(--soft);margin:4px 0 2px;flex-wrap:wrap;justify-content:center}
-  .gauge-metrics b{display:block;font-size:14px;color:var(--txt)}
-  .gauge-pct{font-size:32px;font-weight:700;color:var(--acc);margin-top:-18px}
-
-
-  .detalle-caja{width:340px;position:relative;padding:20px}
-  .detalle-x{position:absolute;top:12px;right:12px}
-  .detalle-top{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px}
-  .detalle-top-info{flex:1}
-  .detalle-nombre-fila{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .detalle-nombre-fila strong{font-size:16px}
-  .detalle-sub{font-size:11.5px;color:var(--soft);margin-top:3px}
-  .detalle-seccion{margin-top:16px}
-  .detalle-seccion-header{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--soft);margin-bottom:8px}
-  .detalle-seccion-nota{font-size:10.5px}
-  .detalle-barra{height:10px;background:#232c38;border-radius:99px;overflow:hidden}
-  .detalle-barra i{display:block;height:100%;background:var(--acc)}
-  .detalle-barra-leyenda{display:flex;justify-content:space-between;margin-top:8px;font-size:11px;color:var(--soft)}
-  .detalle-barra-leyenda b{display:block;font-size:15px;color:var(--txt)}
-  .detalle-footer{margin-top:14px;font-size:11.5px;color:var(--warn);text-align:center}
+  .modal{background:var(--card);border:1px solid var(--line);border-radius:12px;
+         padding:20px;width:400px;max-height:92vh;overflow-y:auto;position:relative}
+  .modal h3{margin:0 0 3px;font-size:16px}
+  .modal .sub{font-size:11.5px;color:var(--tenue);margin-bottom:15px}
+  .modal-x{position:absolute;top:13px;right:13px;background:none;border:none;
+           color:var(--tenue);font-size:15px;cursor:pointer;padding:3px 7px;border-radius:5px}
+  .modal-x:hover{background:var(--card2);color:var(--txt)}
+  .campo{display:block;font-size:11.5px;color:var(--soft);margin-bottom:13px}
+  .campo select,.campo input{width:100%;margin-top:4px}
+  select,input,button{background:#1d2431;color:var(--txt);border:1px solid var(--line);
+                      padding:7px 11px;border-radius:6px;font-size:13px;font-family:inherit}
+  select.mini{padding:3px 7px;font-size:11px}
+  button{cursor:pointer;border-color:var(--acc);color:var(--acc);font-weight:600}
+  button:hover:not(:disabled){background:var(--acc);color:#0e1217}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .acciones{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+  #eco{font-size:11.5px;color:var(--soft);flex:1 0 100%;min-height:16px}
+  #eco.error{color:#ec8080}
+  .checks{display:flex;flex-wrap:wrap;gap:9px;margin-top:6px}
+  .checks label{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--txt)}
+  .ficha{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:11.5px;color:var(--soft)}
+  .ficha b{color:var(--txt);font-weight:500;text-align:right;white-space:nowrap}
+  .sep{margin:16px 0 12px;border-top:1px solid var(--line);padding-top:13px;
+       font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--tenue)}
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Storage Cluster · Caja Nacional de Salud</h1>
-  <div class="resumen" id="resumen"></div>
-  <div class="header-refresh">
-    <select id="refresco">
-      <option value="2">2 s</option>
-      <option value="5" selected>5 s</option>
-      <option value="10">10 s</option>
-      <option value="30">30 s</option>
-    </select>
-    <span id="ultima">—</span>
+  <div class="marca">
+    <div class="sigla">CNS</div>
+    <div>
+      <h1>Storage Cluster · Caja Nacional de Salud</h1>
+      <p id="subtitulo">Monitoreo centralizado de los servidores regionales</p>
+    </div>
   </div>
-  <div class="donut-wrap">
-    <svg id="donut" viewBox="0 0 100 100" width="70" height="70"></svg>
-    <div class="donut-txt"><b id="donutPct">0%</b><span>Utilizado</span></div>
+  <div class="kpis" id="kpis"></div>
+  <div class="conexion">
+    <span class="senal" id="senal"><i></i><span id="senalTxt">conectando…</span></span>
+    <span id="ultima">—</span>
+    <select id="refresco" class="mini" title="Solo se usa si el WebSocket no está disponible">
+      <option value="2">respaldo 2 s</option>
+      <option value="5" selected>respaldo 5 s</option>
+      <option value="10">respaldo 10 s</option>
+    </select>
   </div>
 </header>
 
 <main>
-  <div id="aviso"></div>
+  <div id="alertas"></div>
 
-  <div class="tarjetas" id="tarjetas"></div>
-
-  <div class="paneles-grafico">
-    <div class="grafico-panel grafico-lineas">
-      <div class="grafico-header">
-        <strong>Histórico de utilización</strong>
-        <span id="historial-info"></span>
+  <!-- 3. RANKING + 4. HISTOGRAMA -->
+  <div class="rejilla dos">
+    <section class="panel">
+      <div class="panel-cab">
+        <h2>Utilización por servidor</h2>
+        <span class="pregunta">¿cuál está más lleno?</span>
+        <span class="dato" id="ranking-dato"></span>
       </div>
-      <svg id="grafico" viewBox="0 0 800 240" style="width:100%;height:240px"></svg>
-      <div class="grafico-leyenda" id="leyenda"></div>
-    </div>
+      <div class="barras" id="ranking"></div>
+      <div class="leyenda">
+        <span><i style="background:var(--ok)"></i>Normal · menos de 80 %</span>
+        <span><i style="background:var(--warn)"></i>Atención · 80 a 90 %</span>
+        <span><i style="background:var(--mal)"></i>Crítico · 90 % o más</span>
+        <span><i style="background:#3a4351"></i>No reporta</span>
+      </div>
+    </section>
 
-    <div class="grafico-panel grafico-gauge">
-      <div class="grafico-header"><strong>Utilización global del clúster</strong></div>
-      <div class="gauge-metrics" id="gaugeMetricas"></div>
-      <svg id="gauge" viewBox="0 0 200 118" style="width:100%;max-width:260px;height:130px"></svg>
-      <div class="gauge-pct" id="gaugePct">0%</div>
-    </div>
+    <section class="panel">
+      <div class="panel-cab">
+        <h2>Distribución del clúster</h2>
+        <span class="pregunta">¿está equilibrado?</span>
+      </div>
+      <svg id="histograma" viewBox="0 0 420 210" style="width:100%;height:210px"></svg>
+      <div class="leyenda">
+        <span>Cuántos servidores caen en cada tramo de utilización. Si todos
+              están en un extremo, hay que mover datos o comprar discos.</span>
+      </div>
+    </section>
   </div>
 
-  <div id="modalDetalleFondo" class="modal-fondo">
-  <div class="modal-caja detalle-caja">
-    <button id="detalleCerrar" class="modal-x detalle-x">✕</button>
-      <div class="detalle-top">
-        <img src="/server-icon.png" width="38" height="38" style="filter: brightness(0) invert(1);"/>
-        <div class="detalle-top-info">
-          <div class="detalle-nombre-fila">
-            <strong id="detalleTitulo"></strong>
-            <span id="detalleEstadoPill" class="pill"></span>
-          </div>
-          <div class="detalle-sub" id="detalleUbicacion"></div>
-          <div class="detalle-sub" id="detalleIdIp"></div>
-        </div>
+  <!-- 5. DEPARTAMENTOS + 6. HISTORICO -->
+  <div class="rejilla dos">
+    <section class="panel">
+      <div class="panel-cab">
+        <h2>Capacidad por regional</h2>
+        <span class="pregunta">¿cuánto tiene cada departamento?</span>
       </div>
-
-      <div class="detalle-seccion">
-        <div class="detalle-seccion-header">
-          <span>Actualizaciones del nodo</span>
-          <span id="detalleHistInfo" class="detalle-seccion-nota"></span>
-        </div>
-        <svg id="detalleGrafico" viewBox="0 0 400 90" style="width:100%;height:90px"></svg>
+      <svg id="apiladas" viewBox="0 0 460 240" style="width:100%;height:240px"></svg>
+      <div class="leyenda">
+        <span><i style="background:var(--serie)"></i>Usado</span>
+        <span><i style="background:#2a3442"></i>Libre</span>
+        <span>Un departamento puede tener varias sedes: La Paz suma La Paz y El Alto.</span>
       </div>
+    </section>
 
-      <div class="detalle-seccion">
-        <div class="detalle-seccion-header"><span>Uso de disco</span></div>
-        <div class="detalle-barra"><i id="detalleBarraUso"></i></div>
-        <div class="detalle-barra-leyenda">
-          <div><b id="detalleUsadoPct"></b><span>Usado · <span id="detalleUsadoGb"></span></span></div>
-          <div style="text-align:right"><b id="detalleLibrePct"></b><span>Libre · <span id="detalleLibreGb"></span></span></div>
-        </div>
+    <section class="panel">
+      <div class="panel-cab">
+        <h2>Histórico del clúster</h2>
+        <span class="pregunta">¿está subiendo el uso?</span>
+        <select id="ventana" class="mini">
+          <option value="1">última hora</option>
+          <option value="6" selected>últimas 6 h</option>
+          <option value="24">últimas 24 h</option>
+          <option value="168">última semana</option>
+        </select>
       </div>
-
-      <div class="detalle-footer" id="detalleFooter"></div>
-    </div>
+      <svg id="historico" viewBox="0 0 460 240" style="width:100%;height:240px"></svg>
+      <div class="leyenda">
+        <span><i style="background:var(--serie)"></i>Utilización global</span>
+        <span id="historico-dato"></span>
+      </div>
+    </section>
   </div>
+
+  <!-- 7. TARJETAS -->
+  <section style="margin-top:26px">
+    <div class="panel-cab" style="margin-bottom:14px">
+      <h2 style="font-size:15px">Servidores por regional</h2>
+      <span class="pregunta">ordenados por regional · clic para enviar un mensaje · ⋮ para el detalle ·
+        la mini-línea es la tendencia de las últimas 6 h, con escala propia</span>
+    </div>
+    <div id="regionales"></div>
+  </section>
+
+  <!-- 8. RECURSOS -->
+  <section class="panel">
+    <div class="panel-cab">
+      <h2>Recursos por nodo</h2>
+      <span class="pregunta">RAM, CPU, red y discos adicionales</span>
+      <span class="dato">Lo que reporta cada nodo se configura desde su menú ⋮</span>
+    </div>
+    <div class="tabla-wrap"><table id="tablaRecursos"></table></div>
+  </section>
+
+  <!-- 9. BITACORA -->
+  <section class="panel">
+    <div class="panel-cab">
+      <h2>Bitácora del clúster</h2>
+      <span class="pregunta">altas automáticas, caídas, recuperaciones y sincronizaciones</span>
+    </div>
+    <div id="bitacora"></div>
+  </section>
 </main>
 
-<!-- Modal de mensaje: oculto por defecto, se abre al clickear una tarjeta -->
-<div id="modalFondo" class="modal-fondo">
-  <div class="modal-caja">
-    <div class="modal-header">
-      <strong>Enviar mensaje a un nodo</strong>
-      <button id="modalCerrar" class="modal-x">✕</button>
+<div id="globo"></div>
+
+<!-- ---------------------------------------------------------- detalle -->
+<div id="modalDetalleFondo" class="modal-fondo">
+  <div class="modal">
+    <button id="detalleCerrar" class="modal-x">✕</button>
+    <h3 id="detalleTitulo"></h3>
+    <div class="sub" id="detalleSub"></div>
+    <svg id="detalleGrafico" viewBox="0 0 360 90" style="width:100%;height:90px"></svg>
+    <div class="sub" id="detalleHistInfo" style="margin:4px 0 14px"></div>
+    <div class="pista" style="height:11px"><i id="detalleBarra"></i></div>
+    <div style="display:flex;justify-content:space-between;margin:8px 0 4px;font-size:11.5px;color:var(--soft)">
+      <div><b id="detalleUsado" style="display:block;font-size:15px;color:var(--txt)"></b>usado</div>
+      <div style="text-align:right"><b id="detalleLibre" style="display:block;font-size:15px;color:var(--txt)"></b>libre</div>
     </div>
-    <div class="modal-nodo">Nodo: <b id="modalNodoNombre"></b></div>
-    <input type="text" id="destino" readonly>
-    <label class="modal-campo">Mensaje:
+    <div class="sep">Ficha técnica</div>
+    <div class="ficha" id="detalleFicha"></div>
+  </div>
+</div>
+
+<!-- --------------------------------------------------------- acciones -->
+<div id="modalFondo" class="modal-fondo">
+  <div class="modal">
+    <button id="modalCerrar" class="modal-x">✕</button>
+    <h3>Acciones sobre el nodo</h3>
+    <div class="sub" id="modalNodoNombre"></div>
+    <input type="hidden" id="destino">
+
+    <label class="campo">Mensaje al nodo <em style="color:var(--tenue)">(requisito 7.1)</em>
       <select id="texto">
         <option>Reinicie servicio</option>
         <option>Verifique espacio en disco</option>
         <option>Actualización de configuración</option>
       </select>
     </label>
-    <div class="modal-acciones">
-      <button id="enviar" disabled>Enviar</button>
+    <div class="acciones"><button id="enviar">Enviar mensaje</button></div>
+
+    <label class="campo">Intervalo de envío en segundos <em style="color:var(--tenue)">(requisito 7.3)</em>
+      <input type="number" id="intervalo" min="1" max="3600" value="10">
+    </label>
+    <div class="acciones"><button id="guardarIntervalo">Cambiar intervalo</button></div>
+
+    <label class="campo">Qué debe medir este nodo
+      <div class="checks" id="checksRecursos"></div>
+    </label>
+    <div class="acciones">
+      <button id="guardarRecursos">Aplicar</button>
+      <button id="forzarSync" title="Pedirle que entregue ya lo que tenga guardado">Forzar sincronización</button>
       <span id="eco"></span>
     </div>
   </div>
+</div>
+
 <script>
 "use strict";
-const API = "";
-let timer = null;
-let cargando = false;
-let idsActuales = "";
-let ultimosNodos = [];
 
-const esc = s => String(s ?? "").replace(/[&<>"']/g,
-  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/* =========================================================================
+   ESTADO Y CONSTANTES
+   ========================================================================= */
+const RECURSOS_POSIBLES = ["disco", "discos", "ram", "cpu", "red"];
 
-const gb = v => (v === null || v === undefined || isNaN(Number(v)))
-  ? "—"
-  : Number(v).toLocaleString("es-BO",{minimumFractionDigits:1,maximumFractionDigits:1}) + " GB";
+// Los DOS cortes que dan sentido al color en toda la pantalla. Si algún día
+// cambian, cambian acá y cambian en todos lados a la vez.
+const CORTE_ATENCION = 80;
+const CORTE_CRITICO  = 90;
 
-const fechaHora = t => {
-  if (!t) return "nunca";
-  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
-  const d = new Date(iso);
-  return isNaN(d) ? "—" : d.toLocaleString("es-BO",
-    {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});
+const C = {
+  ok:"#0ca30c", warn:"#fab219", mal:"#d03b3b", apagado:"#3a4351",
+  serie:"#3987e5", serieSuave:"rgba(57,135,229,.16)",
+  linea:"#28313d", tenue:"#6b7787", soft:"#94a1b2", pista:"#1f2733", libre:"#2a3442",
 };
 
-// "hace 2 min" — igual que fechaHora, cuidado con la Z, si no sale corrido.
-const tiempoRelativo = t => {
-  if (!t) return "";
-  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
-  const d = new Date(iso);
-  if (isNaN(d)) return "";
-  const seg = Math.floor((Date.now() - d.getTime()) / 1000);
-  if (seg < 60) return "hace instantes";
-  if (seg < 3600) return `hace ${Math.floor(seg/60)} min`;
-  return `hace ${Math.floor(seg/3600)} h`;
+// El color SIEMPRE sale de esta función: un solo lugar decide qué significa
+// cada color, y el número va escrito al lado en todos los casos.
+const colorDeUso = pct =>
+  pct >= CORTE_CRITICO ? C.mal : pct >= CORTE_ATENCION ? C.warn : C.ok;
+
+let ws = null, modoWS = false, esperaWS = 1000;
+let timerPolling = null, timerLento = null, cargando = false;
+let nodos = [], recursos = [], regionales = [], distribucion = [], cluster = {};
+let sparks = {}, nodoAbierto = null;
+
+/* =========================================================================
+   UTILIDADES
+   ========================================================================= */
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num = v => (v === null || v === undefined || isNaN(Number(v))) ? null : Number(v);
+
+const gb = v => {
+  const n = num(v);
+  if (n === null) return "—";
+  if (n >= 1024) return (n/1024).toLocaleString("es-BO",{maximumFractionDigits:1}) + " TB";
+  return n.toLocaleString("es-BO",{maximumFractionDigits:0}) + " GB";
+};
+const gbExacto = v => {
+  const n = num(v);
+  return n === null ? "—"
+    : n.toLocaleString("es-BO",{minimumFractionDigits:1,maximumFractionDigits:1}) + " GB";
+};
+
+// La API devuelve DATETIME de MySQL sin zona y todo se guarda en UTC. Sin la Z
+// el navegador lo lee como hora local y todo sale corrido cuatro horas: ese
+// error ya nos costó una vez (docs/CAMBIOS.md).
+const conZona = t => /[Zz]|[+-]\d{2}:\d{2}$/.test(t) ? t : t + "Z";
+const fecha = t => { if(!t) return "nunca"; const d=new Date(conZona(t));
+  return isNaN(d)?"—":d.toLocaleString("es-BO",{day:"2-digit",month:"2-digit",
+    hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
+const fechaLarga = t => { if(!t) return "—"; const d=new Date(conZona(t));
+  return isNaN(d)?"—":d.toLocaleString("es-BO",{weekday:"long",day:"2-digit",
+    month:"long",hour:"2-digit",minute:"2-digit"}); };
+const hace = t => {
+  if(!t) return ""; const d=new Date(conZona(t)); if(isNaN(d)) return "";
+  const s=Math.floor((Date.now()-d.getTime())/1000);
+  if(s<0) return "recién"; if(s<60) return "hace instantes";
+  if(s<3600) return `hace ${Math.floor(s/60)} min`;
+  if(s<86400) return `hace ${Math.floor(s/3600)} h`;
+  return `hace ${Math.floor(s/86400)} días`;
 };
 
 async function pedir(ruta){
-  const r = await fetch(API + ruta);
-  if (!r.ok) throw new Error(`${ruta} respondio ${r.status}`);
+  const r = await fetch(ruta);
+  if (!r.ok) throw new Error(`${ruta} respondió ${r.status}`);
   return r.json();
 }
+const $ = id => document.getElementById(id);
 
-async function esperarAck(cmd_id) {
-  const eco = document.getElementById("eco");
-  const inicio = Date.now();
-  const LIMITE_MS = 30000;
-  const intervalo = setInterval(async () => {
-    try {
-      const mensajes = await pedir("/api/messages");
-      const msg = mensajes.find(m => m.cmd_id === cmd_id);
-      if (msg && msg.ack_en) {
-        clearInterval(intervalo);
-        eco.className = "";
-        eco.textContent = `ACK recibido a las ${fechaHora(msg.ack_en)}` +
-          (msg.rtt_ms != null ? ` · ${msg.rtt_ms} ms` : "") +
-          (msg.detalle ? ` · ${esc(msg.detalle)}` : "");
-        return;
-      }
-      if (Date.now() - inicio > LIMITE_MS) {
-        clearInterval(intervalo);
-        eco.className = "error";
-        eco.textContent = "Sin ACK después de 30s. El nodo puede estar caído.";
-      }
-    } catch (e) {}
-  }, 2000);
+/* ---------------------------------------------------------------- globo */
+// Un solo globo para toda la página: se mueve y se rellena. Crear un tooltip
+// por marca dejaría cientos de nodos muertos en el DOM en cada refresco.
+const globo = $("globo");
+function mostrarGlobo(ev, html){
+  globo.innerHTML = html;
+  globo.style.display = "block";
+  const r = globo.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  globo.style.left = x + "px";
+  globo.style.top = y + "px";
+}
+const ocultarGlobo = () => { globo.style.display = "none"; };
+document.addEventListener("scroll", ocultarGlobo, true);
+
+/* =========================================================================
+   TRANSPORTE — WebSocket con respaldo REST
+   ========================================================================= */
+function senal(clase, texto){
+  $("senal").className = "senal " + clase;
+  $("senalTxt").textContent = texto;
 }
 
-function mostrarAviso(texto){
-  const a = document.getElementById("aviso");
-  if (texto) { a.textContent = texto; a.style.display = "block"; }
-  else { a.style.display = "none"; }
+function conectarWS(){
+  try {
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://")
+                       + location.host + "/ws/cluster");
+  } catch (e) { activarRespaldo(); return; }
+
+  ws.onopen = () => {
+    modoWS = true; esperaWS = 1000;
+    clearInterval(timerPolling); timerPolling = null;
+    senal("vivo", "en vivo");
+  };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch(e) { return; }
+    if (m.tipo === "estado") aplicarEstado(m);
+    else if (m.tipo === "latido") marcarHora();   // nada cambió, pero seguimos vivos
+    else if (m.tipo === "error") alertaApi("La API no pudo leer la base de datos.");
+  };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+  ws.onclose = () => {
+    modoWS = false;
+    activarRespaldo();
+    // Backoff con techo: si la API está caída no tiene sentido intentar veinte
+    // veces por segundo, pero tiene que volver sola en cuanto la levanten.
+    setTimeout(conectarWS, esperaWS);
+    esperaWS = Math.min(esperaWS * 2, 15000);
+  };
 }
 
-async function abrirDetalle(node_id){
-  const n = ultimosNodos.find(x => x.node_id === node_id);
-  if (!n) return;
-
-  const on = n.estado === "ACTIVO";
-  document.getElementById("detalleTitulo").textContent = node_id;
-  document.getElementById("detalleEstadoPill").className = `pill ${on?"on":"off"}`;
-  document.getElementById("detalleEstadoPill").textContent = on ? "ACTIVO" : "NO REPORTA";
-  document.getElementById("detalleUbicacion").textContent = n.region ?? "—";
-  document.getElementById("detalleIdIp").textContent = `${n.ip ?? "—"} · ID: ${n.node_id}`;
-
-  const usadoPct = Number(n.uso_pct ?? 0);
-  const librePct = Math.max(0, 100 - usadoPct);
-  document.getElementById("detalleBarraUso").style.width = Math.min(100,Math.max(0,usadoPct)) + "%";
-  document.getElementById("detalleUsadoPct").textContent = usadoPct.toFixed(0) + "%";
-  document.getElementById("detalleLibrePct").textContent = librePct.toFixed(0) + "%";
-  document.getElementById("detalleUsadoGb").textContent = gb(n.usado_gb);
-  document.getElementById("detalleLibreGb").textContent = gb(n.libre_gb);
-
-  document.getElementById("detalleFooter").textContent =
-    (on ? "" : "⚠ ") + `Último reporte: ${tiempoRelativo(n.ultimo_reporte)}`;
-
-  document.getElementById("detalleHistInfo").textContent = "cargando…";
-  document.getElementById("detalleGrafico").innerHTML = "";
-  document.getElementById("modalDetalleFondo").classList.add("visible");
-
-  try{
-    const data = await pedir(`/api/history/${encodeURIComponent(node_id)}`);
-    const puntos = data.puntos || [];
-    dibujarGraficoNodo(puntos, on);
-    document.getElementById("detalleHistInfo").textContent =
-      puntos.length ? `últimas ${data.horas ?? "?"} h` : "sin datos";
-  }catch(e){
-    dibujarGraficoNodo([], on);
-    document.getElementById("detalleHistInfo").textContent = "sin datos";
-  }
+function activarRespaldo(){
+  senal("rest", "modo respaldo");
+  if (timerPolling) return;
+  cargarREST();
+  reprogramar();
+}
+function reprogramar(){
+  clearInterval(timerPolling);
+  timerPolling = setInterval(cargarREST, (Number($("refresco").value)||5) * 1000);
 }
 
-// Linea unica del nodo: roja si esta caido, turquesa si esta activo — el
-// color mismo ya adelanta el estado antes de leer nada.
-function dibujarGraficoNodo(puntos, activo){
-  const svg = document.getElementById("detalleGrafico");
-  const W = 400, H = 90, PAD = 18;
-  if (!puntos.length){
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="var(--soft)" font-size="11" text-anchor="middle">Sin datos históricos todavía</text>`;
-    return;
-  }
-  const n = puntos.length;
-  const x = i => PAD + (i/Math.max(1,n-1)) * (W-PAD*2);
-  const y = v => H - 10 - (v/100) * (H-20);
-  const d = puntos.map((p,i)=>
-    `${i===0?"M":"L"} ${x(i).toFixed(1)} ${y(Number(p.uso_pct??0)).toFixed(1)}`).join(" ");
-  const color = activo ? "var(--acc)" : "var(--mal)";
-  svg.innerHTML = `<path d="${d}" fill="none" stroke="${color}" stroke-width="2"/>`;
-}
-
-async function cargar(){
+// Arma el MISMO objeto que manda el WebSocket, para que aplicarEstado() no
+// tenga que saber por dónde llegaron los datos.
+async function cargarREST(){
   if (cargando) return;
   cargando = true;
   try{
-    const [nodos, cl] = await Promise.all([pedir("/api/nodes"), pedir("/api/cluster")]);
-    mostrarAviso("");
-    pintarResumen(cl, nodos);
-    pintarTarjetas(nodos);
-    ultimosNodos = nodos;
-    pintarGauge(cl);
-    cargarGraficoTodos(nodos);
-    document.getElementById("ultima").textContent =
-      "actualizado " + new Date().toLocaleTimeString("es-BO");
+    const [n, c, r, rec, dist, ev] = await Promise.all([
+      pedir("/api/nodes"), pedir("/api/cluster"), pedir("/api/regions"),
+      pedir("/api/resources").catch(()=>[]),
+      pedir("/api/distribution").catch(()=>[]),
+      pedir("/api/events?limite=15").catch(()=>[]),
+    ]);
+    aplicarEstado({nodos:n, cluster:c, regionales:r, recursos:rec,
+                   distribucion:dist, eventos:ev});
+    if (!modoWS) senal("rest", "modo respaldo");
   }catch(e){
-    mostrarAviso("No se pudo leer la API: " + e.message + ". Los datos de abajo pueden estar desactualizados.");
-    document.getElementById("ultima").textContent = "sin conexión con la API";
-  }finally{
-    cargando = false;
-  }
+    senal("caido", "sin conexión");
+    alertaApi("No se pudo leer la API: " + e.message);
+  }finally{ cargando = false; }
 }
 
-function pintarResumen(c, nodos){
-  const pct = Number(c.uso_pct_global ?? 0);
-  document.getElementById("resumen").innerHTML = `
-    <div><b>${gb(c.capacidad_total_gb)}</b><span>Total</span></div>
-    <div><b>${gb(c.usado_total_gb)}</b><span>Usado</span></div>
-    <div><b>${gb(c.libre_total_gb)}</b><span>Libre</span></div>
-    <div><b>${Number(c.nodos_activos ?? 0)} / ${Number(c.nodos_totales ?? 0)}</b><span>Reportando</span></div>`;
-  document.getElementById("donutPct").textContent = pct.toFixed(0) + "%";
-  const deg = Math.min(100, Math.max(0, pct)) * 3.6;
-  document.getElementById("donut").innerHTML = `
-    <circle cx="50" cy="50" r="42" fill="none" stroke="#28313d" stroke-width="14"/>
-    <circle cx="50" cy="50" r="42" fill="none" stroke="#3fb8b0" stroke-width="14"
-      stroke-dasharray="${2*Math.PI*42}" stroke-dashoffset="${2*Math.PI*42*(1-deg/360)}"
-      transform="rotate(-90 50 50)" stroke-linecap="round"/>`;
+let avisoApi = "";
+const alertaApi = t => { avisoApi = t; pintarAlertas(); };
+const marcarHora = () => {
+  $("ultima").textContent = "actualizado " + new Date().toLocaleTimeString("es-BO");
+};
+
+/* =========================================================================
+   PINTADO
+   ========================================================================= */
+function aplicarEstado(m){
+  nodos = m.nodos || [];
+  cluster = m.cluster || {};
+  regionales = m.regionales || [];
+  recursos = m.recursos || [];
+  distribucion = m.distribucion || [];
+  avisoApi = "";
+  pintarKpis();
+  pintarAlertas();
+  pintarRanking();
+  pintarHistograma();
+  pintarApiladas();
+  pintarTarjetas();
+  pintarRecursos();
+  pintarBitacora(m.eventos || []);
+  if (nodoAbierto) refrescarDetalle(nodoAbierto);
+  marcarHora();
 }
 
-function pintarTarjetas(nodos){
-  actualizarSelector(nodos);
-  const cont = document.getElementById("tarjetas");
+/* ------------------------------------------------------------------ KPIs */
+function pintarKpis(){
+  const pct = Number(cluster.uso_pct_global ?? 0);
+  const extras = Number(cluster.extras_gb ?? 0);
+  $("kpis").innerHTML = `
+    <div class="kpi hero"><span>Utilización</span>
+      <b class="num" style="color:${colorDeUso(pct)}">${pct.toFixed(1)}%</b></div>
+    <div class="kpi"><span>Capacidad</span><b class="num">${gb(cluster.capacidad_total_gb)}</b></div>
+    <div class="kpi"><span>Usado</span><b class="num">${gb(cluster.usado_total_gb)}</b></div>
+    <div class="kpi"><span>Libre</span><b class="num">${gb(cluster.libre_total_gb)}</b></div>
+    <div class="kpi"><span>Reportando</span><b class="num">${cluster.nodos_activos ?? 0}<span
+        style="color:var(--tenue);font-size:15px"> / ${cluster.nodos_totales ?? 0}</span></b></div>
+    <div class="kpi opcional"><span>Regionales</span><b class="num">${cluster.regionales ?? 0}</b></div>
+    ${extras > 0 ? `<div class="kpi opcional"><span>Discos extra</span>
+      <b class="num" style="color:var(--acc)">+${gb(extras)}</b></div>` : ""}`;
+  $("subtitulo").textContent =
+    `${nodos.length} servidores · ${cluster.regionales ?? 0} administraciones regionales`;
+}
+
+/* --------------------------------------------------------------- alertas */
+// Sólo aparecen si hay algo que atender. Un panel que siempre dice "todo bien"
+// deja de leerse a la semana.
+function pintarAlertas(){
+  const caidos = nodos.filter(n => n.estado !== "ACTIVO");
+  const criticos = nodos.filter(n => n.estado === "ACTIVO" && Number(n.uso_pct ?? 0) >= CORTE_CRITICO);
+  const atencion = nodos.filter(n => n.estado === "ACTIVO"
+                    && Number(n.uso_pct ?? 0) >= CORTE_ATENCION
+                    && Number(n.uso_pct ?? 0) < CORTE_CRITICO);
+  const intermitentes = nodos.filter(n => n.intermitente);
+  const sincronizando = nodos.filter(n => Number(n.pendientes_sync ?? 0) > 0);
+  const relojes = nodos.filter(n => n.desvio_reloj_seg != null
+                    && Math.abs(Number(n.desvio_reloj_seg)) > 60);
+
+  const lista = n => n.map(x => `${esc(x.sede || x.region)} (${esc(x.node_id)})`).join(", ");
+  const filas = [];
+
+  if (avisoApi)
+    filas.push(`<div class="alerta mal ancha"><span class="ico">⚠</span><div><b>${esc(avisoApi)}</b>
+      <div class="nodos">Los datos de abajo pueden estar desactualizados.</div></div></div>`);
+
+  if (caidos.length)
+    filas.push(`<div class="alerta mal"><span class="ico">⛔</span><div>
+      <b>${caidos.length} servidor${caidos.length>1?"es":""} sin reportar</b>
+      <div class="nodos">${lista(caidos)}</div></div></div>`);
+
+  if (criticos.length)
+    filas.push(`<div class="alerta mal"><span class="ico">▲</span><div>
+      <b>${criticos.length} servidor${criticos.length>1?"es":""} con el disco al ${CORTE_CRITICO}% o más</b>
+      <div class="nodos">${criticos.map(n=>`${esc(n.sede||n.region)} ${Number(n.uso_pct).toFixed(0)}%`).join(" · ")}</div></div></div>`);
+
+  if (atencion.length)
+    filas.push(`<div class="alerta warn"><span class="ico">▲</span><div>
+      <b>${atencion.length} servidor${atencion.length>1?"es":""} por encima del ${CORTE_ATENCION}%</b>
+      <div class="nodos">${atencion.map(n=>`${esc(n.sede||n.region)} ${Number(n.uso_pct).toFixed(0)}%`).join(" · ")}</div></div></div>`);
+
+  if (intermitentes.length)
+    filas.push(`<div class="alerta warn"><span class="ico">↯</span><div>
+      <b>${intermitentes.length} servidor${intermitentes.length>1?"es":""} con fallo intermitente</b>
+      <div class="nodos">${intermitentes.map(n=>`${esc(n.sede||n.region)} — ${n.caidas_recientes} cortes recientes`).join(" · ")}</div></div></div>`);
+
+  if (sincronizando.length)
+    filas.push(`<div class="alerta info"><span class="ico">⟳</span><div>
+      <b>Recuperando datos de una caída</b>
+      <div class="nodos">${sincronizando.map(n=>`${esc(n.sede||n.region)}: ${n.pendientes_sync} muestras pendientes`).join(" · ")}</div></div></div>`);
+
+  if (relojes.length)
+    filas.push(`<div class="alerta warn"><span class="ico">◷</span><div>
+      <b>${relojes.length} servidor${relojes.length>1?"es":""} con el reloj desviado</b>
+      <div class="nodos">${relojes.map(n=>`${esc(n.sede||n.region)} ${Number(n.desvio_reloj_seg)>0?"+":""}${Number(n.desvio_reloj_seg).toFixed(0)} s`).join(" · ")}
+      — las métricas se fechan con la hora del servidor, no se ven afectadas</div></div></div>`);
+
+  if (!filas.length && nodos.length)
+    filas.push(`<div class="alerta ok ancha"><span class="ico">✓</span><div>
+      <b>Todo en orden</b><div class="nodos">Los ${nodos.length} servidores reportan
+      y ninguno pasa del ${CORTE_ATENCION}% de utilización.</div></div></div>`);
+
+  $("alertas").innerHTML = filas.join("");
+}
+
+/* -------------------------------------------- ranking de utilización */
+function pintarRanking(){
+  const cont = $("ranking");
   if (!nodos.length){
-    cont.innerHTML = `<div style="grid-column:1/-1;text-align:center;color:var(--soft);padding:28px">
-      Todavía no hay nodos registrados. Levantá los clientes.</div>`;
+    cont.innerHTML = `<div class="vacio">Todavía no hay servidores. Levantá los clientes:
+      <code>python scripts/lanzar_nodos.py --host &lt;IP&gt;</code></div>`;
+    $("ranking-dato").textContent = "";
     return;
   }
-  cont.innerHTML = nodos.map(n=>{
+  // Ordenado de más lleno a menos: la pregunta es "cuál está más lleno", y la
+  // respuesta tiene que estar arriba de todo, no perdida en orden alfabético.
+  const orden = [...nodos].sort((a,b) => {
+    if ((a.estado==="ACTIVO") !== (b.estado==="ACTIVO")) return a.estado==="ACTIVO" ? 1 : -1;
+    return Number(b.uso_pct ?? 0) - Number(a.uso_pct ?? 0);
+  });
+  $("ranking-dato").textContent =
+    `${orden.filter(n=>n.estado==="ACTIVO").length} reportando de ${orden.length}`;
+
+  cont.innerHTML = orden.map(n => {
+    const on = n.estado === "ACTIVO";
     const pct = Number(n.uso_pct ?? 0);
-    const cls = pct >= 90 ? "alto" : pct >= 80 ? "medio" : "";
-    const on  = n.estado === "ACTIVO";
-    return `<div class="tarjeta ${on?"":"caida"}" data-node="${esc(n.node_id)}">
-      <button class="t-menu" data-node="${esc(n.node_id)}" title="Más datos">⋮</button>
-      <img src="/server-icon.png" width="40" height="40" style="display: block; margin: 0 auto; filter: brightness(0) invert(1);"/>
-      <div class="t-region">${esc(n.region)}</div>
-      <div class="t-datos">
-        ID: ${esc(n.node_id)}<br>
-        ${esc(n.region)} (Regional)<br>
-        OS: ${esc(n.sistema_operativo ?? "—")}<br>
-        Disco: ${esc(n.disco_nombre ?? "—")}<br>
-        Tipo: ${esc(n.disco_tipo ?? "—")}<br>
-        Capacidad: ${gb(n.total_gb)}<br>
-        Usado: ${gb(n.usado_gb)}<br>
-        Libre: ${gb(n.libre_gb)}
-      </div>
-      <div class="barra"><i class="${cls}" style="width:${Math.min(100,Math.max(0,pct))}%"></i></div>
-      <div class="t-pct">${pct.toFixed(1)}% Utilización</div>
-      <span class="pill ${on?"on":"off"}">ESTADO: ${on?"ACTIVO":"NO REPORTA"}</span>
-      <div class="t-reporte">Último reporte: ${fechaHora(n.ultimo_reporte)} (${tiempoRelativo(n.ultimo_reporte)})</div>
+    return `<div class="fila ${on?"":"off"}" data-node="${esc(n.node_id)}">
+      <div class="quien">${esc(n.sede || n.region)}<small>${esc(n.region)} · ${esc(n.node_id)}</small></div>
+      <div class="pista"><i style="width:${on?Math.max(1.5,Math.min(100,pct)):100}%;
+        background:${on?colorDeUso(pct):C.apagado}"></i></div>
+      <div class="cifra num">${on
+        ? `<b>${pct.toFixed(1)}%</b> <span style="color:var(--tenue)">${gb(n.total_gb)}</span>`
+        : `<span style="color:#e08f8f">no reporta</span>`}</div>
     </div>`;
   }).join("");
 
-  cont.querySelectorAll(".tarjeta").forEach(el=>{
-    el.onclick = () => abrirModal(el.dataset.node);
+  cont.querySelectorAll(".fila").forEach(el => {
+    const n = nodos.find(x => x.node_id === el.dataset.node);
+    el.onclick = () => abrirDetalle(el.dataset.node);
+    el.onmousemove = ev => mostrarGlobo(ev, `<b>${esc(n.sede || n.region)}</b><br>
+      <em>${esc(n.region)} · ${esc(n.node_id)}</em><br>
+      ${n.estado === "ACTIVO"
+        ? `Usado <b>${gbExacto(n.usado_gb)}</b> de ${gbExacto(n.total_gb)}<br>
+           Libre <b>${gbExacto(n.libre_gb)}</b><br>
+           <em>último reporte ${hace(n.ultimo_reporte)}</em>`
+        : `<span style="color:#ec8080">Sin reportar ${hace(n.ultimo_reporte)}</span>`}`);
+    el.onmouseleave = ocultarGlobo;
   });
-
-  // El botón de tres puntos va DENTRO de la tarjeta clickeable, así que
-  // hay que frenar la propagación: si no, cada click en "⋮" también
-  // abriría el modal de mensaje al mismo tiempo que el de detalle.
-  cont.querySelectorAll(".t-menu").forEach(btn=>{
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      abrirDetalle(btn.dataset.node);
-    };
-  });
 }
 
-function actualizarSelector(nodos){
-  const dest = document.getElementById("destino");
-  const ids = nodos.map(n => n.node_id).join("|");
-  if (ids !== idsActuales){
-    const elegido = dest.value;
-    dest.innerHTML = nodos.map(n =>
-      `<option value="${esc(n.node_id)}">${esc(n.node_id)}</option>`).join("");
-    if (nodos.some(n => n.node_id === elegido)) dest.value = elegido;
-    idsActuales = ids;
-  }
-  document.getElementById("enviar").disabled = nodos.length === 0;
-}
-
-// Un color estable por node_id, calculado por hash del texto — así el
-// mismo nodo siempre tiene el mismo color entre refrescos, sin importar
-// el orden en que la API devuelva la lista.
-
-function construirMapaColores(ids){
-  const ordenados = [...ids].sort();
-  const mapa = {};
-  ordenados.forEach((id, i) => {
-    const hue = (i * 137.508) % 360;
-    mapa[id] = `hsl(${hue.toFixed(0)}, 70%, 58%)`;
-  });
-  return mapa;
-}
-
-function aMs(timestamp){
-  const iso = /[Zz]|[+-]\d{2}:\d{2}$/.test(timestamp) ? timestamp : timestamp + "Z";
-  return new Date(iso).getTime();
-}
-
-// Trae el historial de TODOS los nodos en paralelo. Si uno falla (nodo
-// nuevo sin historial, o timeout puntual) no tira abajo a los demás:
-// ese nodo simplemente no dibuja línea.
-async function cargarGraficoTodos(nodos){
-  const info = document.getElementById("historial-info");
-  const resultados = await Promise.all(nodos.map(n =>
-    pedir(`/api/history/${encodeURIComponent(n.node_id)}`)
-      .then(d => ({ node_id: n.node_id, puntos: d.puntos || [] }))
-      .catch(() => ({ node_id: n.node_id, puntos: [] }))
-  ));
-  dibujarGraficoMultinodo(resultados);
-  info.textContent = "actualizado " + new Date().toLocaleTimeString("es-BO");
-}
-
-function dibujarGraficoMultinodo(series){
-  const svg = document.getElementById("grafico");
-  const leyenda = document.getElementById("leyenda");
-  const W = 800, H = 240, PAD = 34;
-
-  const conDatos = series.filter(s => s.puntos.length);
-  if (!conDatos.length){
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="var(--soft)" font-size="13" text-anchor="middle">Sin datos históricos todavía</text>`;
-    leyenda.innerHTML = "";
+/* ------------------------------------------------------------ histograma */
+function pintarHistograma(){
+  const svg = $("histograma");
+  const W = 420, H = 210, PAD_I = 34, PAD_D = 12, PAD_S = 16, PAD_B = 44;
+  if (!distribucion.length){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="${C.tenue}" font-size="12"
+      text-anchor="middle">Sin datos todavía</text>`;
     return;
   }
+  const maxN = Math.max(1, ...distribucion.map(d => d.nodos));
+  const anchoUtil = W - PAD_I - PAD_D;
+  const paso = anchoUtil / distribucion.length;
+  const y = v => H - PAD_B - (v / maxN) * (H - PAD_S - PAD_B);
 
-  const colores = construirMapaColores(conDatos.map(s => s.node_id));
+  // Eje: sólo enteros, y como mucho cinco marcas. Un eje con 0.5 servidores
+  // no significa nada.
+  const marcas = [];
+  const salto = Math.max(1, Math.ceil(maxN / 4));
+  for (let v = 0; v <= maxN; v += salto) marcas.push(v);
 
-  let tMin = Infinity, tMax = -Infinity;
-  conDatos.forEach(s => s.puntos.forEach(p => {
-    const t = aMs(p.timestamp);
-    if (t < tMin) tMin = t;
-    if (t > tMax) tMax = t;
-  }));
-  if (tMin === tMax) tMax = tMin + 1;
+  const guias = marcas.map(v => `
+    <line x1="${PAD_I}" y1="${y(v).toFixed(1)}" x2="${W-PAD_D}" y2="${y(v).toFixed(1)}"
+          stroke="${C.linea}" stroke-width="1"/>
+    <text x="${PAD_I-7}" y="${(y(v)+3.5).toFixed(1)}" fill="${C.tenue}" font-size="9.5"
+          text-anchor="end">${v}</text>`).join("");
 
-  const x = t => PAD + ((t - tMin) / (tMax - tMin)) * (W - PAD * 2);
-  const y = v => H - PAD - (v / 100) * (H - PAD * 2);
-
-  const guias = [0, 50, 100].map(v => `
-    <line x1="${PAD}" y1="${y(v)}" x2="${W-PAD}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/>
-    <text x="4" y="${y(v)+4}" fill="var(--soft)" font-size="10">${v}%</text>`).join("");
-
-  const lineas = conDatos.map(s => {
-    const d = s.puntos.map((p, i) =>
-      `${i === 0 ? "M" : "L"} ${x(aMs(p.timestamp)).toFixed(1)} ${y(Number(p.uso_pct ?? 0)).toFixed(1)}`
-    ).join(" ");
-    return `<path d="${d}" fill="none" stroke="${colores[s.node_id]}" stroke-width="2" opacity="0.9"/>`;
+  const barras = distribucion.map((d, i) => {
+    const x = PAD_I + i * paso + 5;
+    const w = paso - 10;
+    const alto = Math.max(d.nodos ? 3 : 0, H - PAD_B - y(d.nodos));
+    // Una sola serie -> un solo color. Colorear cada barra según su valor
+    // sería codificar dos veces lo mismo y quemar el único canal libre.
+    return `<g class="hb" data-i="${i}" style="cursor:default">
+      <rect x="${x}" y="${(H-PAD_B-alto).toFixed(1)}" width="${w}" height="${alto.toFixed(1)}"
+            rx="4" fill="${C.serie}"/>
+      ${d.nodos ? `<text x="${x+w/2}" y="${(H-PAD_B-alto-6).toFixed(1)}" fill="${C.soft}"
+            font-size="11" font-weight="700" text-anchor="middle">${d.nodos}</text>` : ""}
+      <text x="${x+w/2}" y="${H-PAD_B+15}" fill="${C.tenue}" font-size="9.5"
+            text-anchor="middle">${d.desde}–${d.hasta}%</text>
+      <rect x="${x-5}" y="${PAD_S}" width="${paso}" height="${H-PAD_B-PAD_S}" fill="transparent"/>
+    </g>`;
   }).join("");
 
-  svg.innerHTML = guias + lineas;
+  svg.innerHTML = guias + barras + `
+    <line x1="${PAD_I}" y1="${H-PAD_B}" x2="${W-PAD_D}" y2="${H-PAD_B}"
+          stroke="${C.linea}" stroke-width="1"/>
+    <text x="${PAD_I + anchoUtil/2}" y="${H-10}" fill="${C.tenue}" font-size="10"
+          text-anchor="middle">utilización del disco</text>`;
 
-  leyenda.innerHTML = conDatos.map(s =>
-    `<span class="leyenda-item"><i style="background:${colores[s.node_id]}"></i>${esc(s.node_id)}</span>`
-  ).join("");
+  svg.querySelectorAll(".hb").forEach(g => {
+    const d = distribucion[Number(g.dataset.i)];
+    g.onmousemove = ev => mostrarGlobo(ev,
+      `<b>${d.nodos} servidor${d.nodos===1?"":"es"}</b> entre ${d.desde}% y ${d.hasta}%` +
+      (d.node_ids && d.node_ids.length
+        ? `<br><em>${d.node_ids.map(esc).join(", ")}</em>` : ""));
+    g.onmouseleave = ocultarGlobo;
+  });
 }
 
-function pintarGauge(c){
-  const pct = Math.min(100, Math.max(0, Number(c.uso_pct_global ?? 0)));
-  document.getElementById("gaugeMetricas").innerHTML = `
-    <div><b>${gb(c.capacidad_total_gb)}</b>Total</div>
-    <div><b>${gb(c.usado_total_gb)}</b>Usado</div>
-    <div><b>${gb(c.libre_total_gb)}</b>Libre</div>`;
-  document.getElementById("gaugePct").textContent = pct.toFixed(1) + "%";
-
-  const r = 80, cx = 100, cy = 100;
-  const circunferencia = Math.PI * r;
-  const dash = circunferencia * (pct / 100);
-  // mismo umbral 80/90 que ya usa la barra de cada tarjeta, para que el
-  // color signifique lo mismo en toda la interfaz.
-  const color = pct >= 90 ? "var(--mal)" : pct >= 80 ? "var(--warn)" : "var(--acc)";
-
-  document.getElementById("gauge").innerHTML = `
-    <path d="M${cx-r},${cy} A${r},${r} 0 0 1 ${cx+r},${cy}"
-      fill="none" stroke="var(--line)" stroke-width="16" stroke-linecap="round"/>
-    <path d="M${cx-r},${cy} A${r},${r} 0 0 1 ${cx+r},${cy}"
-      fill="none" stroke="${color}" stroke-width="16" stroke-linecap="round"
-      stroke-dasharray="${dash.toFixed(1)} ${circunferencia.toFixed(1)}"/>
-  `;
-}
-
-// --------------------------------------------------------------- modal
-
-function abrirModal(node_id){
-  document.getElementById("destino").value = node_id;
-  document.getElementById("eco").textContent = "";
-  document.getElementById("eco").className = "";
-  document.getElementById("modalFondo").classList.add("visible");
-}
-function cerrarModal(){
-
-  document.getElementById("modalFondo").classList.remove("visible");
-}
-
-function cerrarDetalle(){
-  document.getElementById("modalDetalleFondo").classList.remove("visible");
-}
-document.getElementById("detalleCerrar").onclick = cerrarDetalle;
-document.getElementById("modalDetalleFondo").onclick = (e) => {
-  if (e.target.id === "modalDetalleFondo") cerrarDetalle();
-};
-
-document.getElementById("modalCerrar").onclick = cerrarModal;
-document.getElementById("modalFondo").onclick = (e) => {
-  if (e.target.id === "modalFondo") cerrarModal();
-};
-
-document.getElementById("enviar").onclick = async () => {
-  const boton = document.getElementById("enviar");
-  const eco = document.getElementById("eco");
-  const node_id = document.getElementById("destino").value;
-  const texto = document.getElementById("texto").value;
-  if (!node_id) return;
-  boton.disabled = true;
-  eco.className = "";
-  eco.textContent = "Enviando…";
-  try{
-    const r = await fetch(API + "/api/message", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({node_id, texto})
-    });
-    const cuerpo = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(cuerpo.detail || `HTTP ${r.status}`);
-    eco.textContent = `Encolado ${String(cuerpo.cmd_id).slice(0,8)}… esperando ACK`;
-    esperarAck(cuerpo.cmd_id);
-  }catch(e){
-    eco.className = "error";
-    eco.textContent = "No se pudo enviar: " + e.message;
-  }finally{
-    boton.disabled = false;
+/* -------------------------------------------------- apiladas por regional */
+function pintarApiladas(){
+  const svg = $("apiladas");
+  const W = 460, H = 240, PAD_I = 96, PAD_D = 14, PAD_S = 10, PAD_B = 26;
+  const datos = [...regionales].filter(r => Number(r.capacidad_total_gb) > 0)
+                               .sort((a,b) => b.capacidad_total_gb - a.capacidad_total_gb);
+  if (!datos.length){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="${C.tenue}" font-size="12"
+      text-anchor="middle">Sin datos todavía</text>`;
+    return;
   }
-};
+  const maxCap = Math.max(...datos.map(r => Number(r.capacidad_total_gb)));
+  const anchoUtil = W - PAD_I - PAD_D;
+  const paso = (H - PAD_S - PAD_B) / datos.length;
+  const alto = Math.min(20, paso - 7);
+  const x = v => (v / maxCap) * anchoUtil;
 
-function reprogramar(){
-  clearInterval(timer);
-  timer = setInterval(cargar, Number(document.getElementById("refresco").value) * 1000);
+  const filas = datos.map((r, i) => {
+    const y = PAD_S + i * paso + (paso - alto) / 2;
+    const usado = x(Number(r.usado_total_gb));
+    const total = x(Number(r.capacidad_total_gb));
+    const pct = Number(r.uso_pct ?? 0);
+    // Hueco de 2 px entre el segmento usado y el libre: sin él, dos rellenos
+    // pegados se leen como una sola forma y el corte se pierde.
+    return `<g class="ab" data-i="${i}" style="cursor:default">
+      <rect x="${PAD_I}" y="${y}" width="${Math.max(total,2).toFixed(1)}" height="${alto}"
+            rx="4" fill="${C.libre}"/>
+      ${usado > 2 ? `<rect x="${PAD_I}" y="${y}" width="${(usado-2).toFixed(1)}" height="${alto}"
+            rx="4" fill="${C.serie}"/>` : ""}
+      <text x="${PAD_I-9}" y="${(y+alto/2+3.5).toFixed(1)}" fill="${C.soft}" font-size="11"
+            text-anchor="end">${esc(r.region)}</text>
+      <text x="${(PAD_I+total+7).toFixed(1)}" y="${(y+alto/2+3.5).toFixed(1)}"
+            fill="${C.tenue}" font-size="10">${pct.toFixed(0)}%</text>
+      <rect x="0" y="${y-3}" width="${W}" height="${alto+6}" fill="transparent"/>
+    </g>`;
+  }).join("");
+
+  svg.innerHTML = filas + `
+    <text x="${PAD_I}" y="${H-8}" fill="${C.tenue}" font-size="10">0</text>
+    <text x="${W-PAD_D}" y="${H-8}" fill="${C.tenue}" font-size="10"
+          text-anchor="end">${gb(maxCap)}</text>`;
+
+  svg.querySelectorAll(".ab").forEach(g => {
+    const r = datos[Number(g.dataset.i)];
+    g.onmousemove = ev => mostrarGlobo(ev, `<b>${esc(r.region)}</b><br>
+      <em>${esc(r.sedes || "")}</em><br>
+      Capacidad <b>${gbExacto(r.capacidad_total_gb)}</b><br>
+      Usado <b>${gbExacto(r.usado_total_gb)}</b> · Libre <b>${gbExacto(r.libre_total_gb)}</b><br>
+      <em>${r.nodos_activos} de ${r.nodos} servidor${r.nodos>1?"es":""} reportando</em>`);
+    g.onmouseleave = ocultarGlobo;
+  });
 }
-document.getElementById("refresco").onchange = reprogramar;
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible"){ cargar(); reprogramar(); }
-  else clearInterval(timer);
+
+/* ------------------------------------------------------------- histórico */
+let serieCluster = [];
+async function cargarHistorico(){
+  const horas = Number($("ventana").value) || 6;
+  try{
+    const d = await pedir(`/api/history-cluster?horas=${horas}&puntos=140`);
+    serieCluster = d.puntos || [];
+    pintarHistorico(horas);
+  }catch(e){ /* se queda el dibujo anterior: no es crítico */ }
+}
+
+function pintarHistorico(horas){
+  const svg = $("historico"), W = 460, H = 240, PAD_I = 34, PAD_D = 12, PAD_S = 14, PAD_B = 28;
+  if (serieCluster.length < 2){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="${C.tenue}" font-size="12"
+      text-anchor="middle">Todavía no hay suficiente histórico</text>`;
+    $("historico-dato").textContent = "";
+    return;
+  }
+  const ts = serieCluster.map(p => new Date(conZona(p.t)).getTime());
+  const tMin = ts[0], tMax = ts[ts.length-1] || tMin + 1;
+  const x = t => PAD_I + ((t - tMin) / Math.max(1, tMax - tMin)) * (W - PAD_I - PAD_D);
+  const y = v => H - PAD_B - (v / 100) * (H - PAD_S - PAD_B);
+
+  const guias = [0,25,50,75,100].map(v => `
+    <line x1="${PAD_I}" y1="${y(v).toFixed(1)}" x2="${W-PAD_D}" y2="${y(v).toFixed(1)}"
+          stroke="${C.linea}" stroke-width="1"/>
+    <text x="${PAD_I-6}" y="${(y(v)+3.5).toFixed(1)}" fill="${C.tenue}" font-size="9.5"
+          text-anchor="end">${v}%</text>`).join("");
+
+  const pts = serieCluster.map((p,i) => [x(ts[i]), y(Number(p.uso_pct ?? 0))]);
+  const linea = pts.map((p,i) => `${i?"L":"M"} ${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ");
+  const area = `${linea} L ${pts[pts.length-1][0].toFixed(1)} ${H-PAD_B} L ${pts[0][0].toFixed(1)} ${H-PAD_B} Z`;
+
+  const marca = t => new Date(t).toLocaleTimeString("es-BO",
+    horas > 48 ? {day:"2-digit",month:"2-digit"} : {hour:"2-digit",minute:"2-digit"});
+
+  svg.innerHTML = guias +
+    `<path d="${area}" fill="${C.serieSuave}"/>
+     <path d="${linea}" fill="none" stroke="${C.serie}" stroke-width="2"
+           stroke-linejoin="round" stroke-linecap="round"/>
+     <circle id="hx-punto" r="4" fill="${C.serie}" stroke="${C.linea}" stroke-width="2"
+             style="display:none"/>
+     <line id="hx-linea" y1="${PAD_S}" y2="${H-PAD_B}" stroke="${C.soft}" stroke-width="1"
+           stroke-dasharray="3 3" style="display:none"/>
+     <text x="${PAD_I}" y="${H-8}" fill="${C.tenue}" font-size="9.5">${marca(tMin)}</text>
+     <text x="${W-PAD_D}" y="${H-8}" fill="${C.tenue}" font-size="9.5"
+           text-anchor="end">${marca(tMax)}</text>
+     <rect id="hx-zona" x="${PAD_I}" y="${PAD_S}" width="${W-PAD_I-PAD_D}"
+           height="${H-PAD_S-PAD_B}" fill="transparent" style="cursor:crosshair"/>`;
+
+  const ultimo = serieCluster[serieCluster.length-1];
+  const primero = serieCluster[0];
+  const delta = Number(ultimo.uso_pct) - Number(primero.uso_pct);
+  $("historico-dato").innerHTML =
+    `${serieCluster.length} puntos · ${delta >= 0 ? "subió" : "bajó"}
+     <b style="color:${delta >= 0 ? "#e5ba63" : "#4cc44c"}">${Math.abs(delta).toFixed(1)} puntos</b>
+     en la ventana`;
+
+  // Cruceta: sigue al punto más cercano en el eje del tiempo, no al píxel
+  // exacto — así el globo nunca muestra un valor interpolado que no existe.
+  const zona = svg.querySelector("#hx-zona");
+  const punto = svg.querySelector("#hx-punto");
+  const cruz = svg.querySelector("#hx-linea");
+  zona.onmousemove = ev => {
+    const caja = svg.getBoundingClientRect();
+    const px = (ev.clientX - caja.left) / caja.width * W;
+    let mejor = 0, dist = Infinity;
+    pts.forEach((p,i) => { const d = Math.abs(p[0]-px); if (d < dist){ dist = d; mejor = i; } });
+    const p = serieCluster[mejor];
+    punto.setAttribute("cx", pts[mejor][0]); punto.setAttribute("cy", pts[mejor][1]);
+    punto.style.display = "block";
+    cruz.setAttribute("x1", pts[mejor][0]); cruz.setAttribute("x2", pts[mejor][0]);
+    cruz.style.display = "block";
+    mostrarGlobo(ev, `<b>${Number(p.uso_pct).toFixed(1)}%</b> de utilización<br>
+      ${gbExacto(p.usado_gb)} de ${gbExacto(p.total_gb)}<br>
+      <em>${fecha(p.t)} · ${p.nodos} nodo${p.nodos>1?"s":""}</em>`);
+  };
+  zona.onmouseleave = () => {
+    punto.style.display = "none"; cruz.style.display = "none"; ocultarGlobo();
+  };
+}
+
+/* -------------------------------------------------------------- tarjetas */
+// La mini-linea se escala a SU PROPIO rango, no a 0-100.
+//
+// Con escala fija, un nodo al 93% dibuja una raya pegada al techo: se ve que
+// esta lleno (eso ya lo dice el numero enorme que esta justo arriba) pero no
+// se ve lo unico que la mini-linea puede aportar, que es si esta subiendo,
+// bajando o estable.
+//
+// El riesgo de auto-escalar es amplificar ruido: un disco que se movio 0.05
+// puntos dibujaria una montana rusa. Por eso, si el recorrido es menor a dos
+// puntos porcentuales, se dibuja plana a proposito.
+function miniLinea(serie, color, w, h, marcas){
+  if (!serie || serie.length < 2)
+    return `<line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="${C.linea}"
+                  stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  const n = serie.length;
+  const min = Math.min(...serie), max = Math.max(...serie);
+  const recorrido = max - min;
+  const margen = recorrido < 2 ? 1.5 : recorrido * 0.18;
+  const lo = min - margen, hi = max + margen;
+  const x = i => (i/(n-1))*w;
+  const y = v => h - 2 - ((v - lo)/Math.max(0.001, hi - lo))*(h - 4);
+  const d = serie.map((v,i) => `${i?"L":"M"} ${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
+  const puntos = (marcas || []).map((esSync,i) => esSync
+    ? `<circle cx="${x(i).toFixed(1)}" cy="${y(serie[i]).toFixed(1)}" r="2" fill="#7d8ff0"/>`
+    : "").join("");
+  return `<path d="${d} L ${w} ${h} L 0 ${h} Z" fill="${color}" opacity="0.12"/>
+          <path d="${d}" fill="none" stroke="${color}" stroke-width="1.6"
+                stroke-linejoin="round" stroke-linecap="round"/>${puntos}`;
+}
+
+function pintarTarjetas(){
+  const cont = $("regionales");
+  if (!nodos.length){ cont.innerHTML = ""; return; }
+
+  // UNA rejilla densa, ordenada por departamento y sede.
+  //
+  // La version anterior hacia una seccion por departamento con su titulo. Como
+  // ocho de las nueve regionales tienen UN solo servidor, cada seccion era una
+  // tarjeta sola en una fila de 1500 px: dos mil pixeles de pantalla en blanco
+  // para diez servidores, y habia que hacer scroll para ver el ultimo.
+  //
+  // El agrupado no se pierde: cada tarjeta dice a que departamento pertenece,
+  // los servidores del mismo departamento quedan uno al lado del otro, y el
+  // consolidado POR regional esta arriba, en su propio grafico. La Paz y El
+  // Alto se ven juntos, con el total del departamento en la barra de arriba.
+  const orden = [...nodos].sort((a,b) =>
+    a.region.localeCompare(b.region) ||
+    String(a.sede||"").localeCompare(String(b.sede||"")));
+  cont.innerHTML = `<div class="tarjetas">${orden.map(tarjeta).join("")}</div>`;
+
+  cont.querySelectorAll(".tarjeta").forEach(el => {
+    el.onclick = () => abrirAcciones(el.dataset.node);
+  });
+  // El botón ⋮ vive DENTRO de la tarjeta clickeable: sin stopPropagation se
+  // abrirían los dos modales a la vez.
+  cont.querySelectorAll(".t-menu").forEach(b => {
+    b.onclick = ev => { ev.stopPropagation(); abrirDetalle(b.dataset.node); };
+  });
+}
+
+function tarjeta(n){
+  const on = n.estado === "ACTIVO";
+  const pct = Number(n.uso_pct ?? 0);
+  const color = on ? colorDeUso(pct) : C.apagado;
+  const extra = Number(n.extra_disco_gb ?? 0);
+
+  const tags = [];
+  if (n.origen_ultima_metrica === "SYNC")
+    tags.push(`<span class="tag sync" title="El último dato se recuperó del buffer del nodo tras una caída">RECUPERADO</span>`);
+  if (Number(n.pendientes_sync ?? 0) > 0)
+    tags.push(`<span class="tag sync">SINCRONIZANDO ${n.pendientes_sync}</span>`);
+  if (n.intermitente)
+    tags.push(`<span class="tag inter" title="${n.caidas_recientes} cortes recientes">INTERMITENTE</span>`);
+  if (n.desvio_reloj_seg != null && Math.abs(Number(n.desvio_reloj_seg)) > 60)
+    tags.push(`<span class="tag reloj">RELOJ ${Number(n.desvio_reloj_seg)>0?"+":""}${Number(n.desvio_reloj_seg).toFixed(0)}s</span>`);
+  if (n.disco_tipo === "USB") tags.push(`<span class="tag usb">USB</span>`);
+
+  const caida = (!on && n.ultima_desconexion)
+    ? `<div class="t-caida">Se desconectó de la red el<br><b>${esc(fechaLarga(n.ultima_desconexion))}</b>${
+        n.motivo_desconexion ? `<br><span style="color:var(--tenue)">${esc(n.motivo_desconexion)}</span>` : ""}</div>`
+    : "";
+
+  return `<div class="tarjeta ${on?"":"off"}" data-node="${esc(n.node_id)}">
+    <div class="tope">
+      <svg class="disco" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.6">
+        <rect x="2" y="4" width="20" height="6" rx="2"/><rect x="2" y="14" width="20" height="6" rx="2"/>
+        <circle cx="6" cy="7" r="1" fill="${color}" stroke="none"/>
+        <circle cx="6" cy="17" r="1" fill="${color}" stroke="none"/>
+      </svg>
+      <div class="quien" title="${esc(n.sede || n.region)} · ${esc(n.region)} · ${esc(n.node_id)}">
+        <b>${esc(n.sede || n.region)}</b>
+        <span class="dep">${esc(n.region)}</span>
+        <small>${esc(n.node_id)}</small>
+      </div>
+      <button class="t-menu" data-node="${esc(n.node_id)}" title="Ver detalle">⋮</button>
+    </div>
+    <div class="t-cifras">
+      <span class="t-pct num" style="color:${color}">${on ? pct.toFixed(1)+"%" : "—"}</span>
+      <span class="t-cap num">${gb(n.usado_gb)} de ${gb(n.total_gb)}<br>
+        <span style="color:var(--tenue)">${gb(n.libre_gb)} libres${
+          extra>0 ? ` · +${gb(extra)} extra` : ""}</span></span>
+    </div>
+    <div class="pista"><i style="width:${on?Math.max(2,Math.min(100,pct)):100}%;background:${color}"></i></div>
+    <svg class="t-spark" viewBox="0 0 200 30" preserveAspectRatio="none"
+         style="width:100%">${miniLinea(sparks[n.node_id], color, 200, 30)}</svg>
+    <div class="t-pie">
+      <span class="estado ${on?"on":"off"}">${on?"ACTIVO":"NO REPORTA"}</span>
+      ${tags.join("")}
+      <span style="margin-left:auto">${esc(hace(n.ultimo_reporte))}</span>
+    </div>
+    ${caida}
+  </div>`;
+}
+
+/* -------------------------------------------------------------- recursos */
+const NOMBRE_TIPO = {DISCO:"Disco", RAM:"Memoria", CPU:"CPU", RED:"Red", CUSTOM:"Otro"};
+function pintarRecursos(){
+  const t = $("tablaRecursos");
+  if (!recursos.length){
+    t.innerHTML = `<tbody><tr><td class="vacio">Ningún nodo está reportando recursos
+      extra todavía. Se activan por nodo desde su menú ⋮, o al arrancar el cliente
+      con <code>--recursos disco,discos,ram,cpu</code>.</td></tr></tbody>`;
+    return;
+  }
+  const donde = {};
+  nodos.forEach(n => donde[n.node_id] = n);
+
+  t.innerHTML = `<thead><tr>
+      <th>Servidor</th><th>Tipo</th><th>Recurso</th>
+      <th>Capacidad</th><th>Usado</th><th style="width:170px">Utilización</th><th>Medido</th>
+    </tr></thead><tbody>` + recursos.map(r => {
+    const n = donde[r.node_id] || {};
+    const m = r.metricas || {}, e = r.etiquetas || {};
+    const pct = num(r.uso_pct);
+    const otras = Object.entries(m)
+      .filter(([k]) => !["total_gb","usado_gb","libre_gb","uso_pct"].includes(k))
+      .map(([k,v]) => `${esc(k.replace(/_/g," "))} <b>${esc(String(v))}</b>`).join(" · ");
+    return `<tr>
+      <td>${esc(n.sede || r.node_id)}<div style="font-size:10.5px;color:var(--tenue)">${esc(r.node_id)}</div></td>
+      <td>${esc(NOMBRE_TIPO[r.tipo] || r.tipo)}</td>
+      <td>${esc(r.nombre)}
+        ${e.removible === "si" ? `<span class="tag usb" style="margin-left:6px">EXTRAÍBLE</span>` : ""}
+        ${e.principal === "si" ? `<span style="font-size:10px;color:var(--tenue);margin-left:6px">principal</span>` : ""}</td>
+      <td class="num">${r.total_gb != null ? gb(r.total_gb) : "—"}</td>
+      <td class="num">${r.usado_gb != null ? gb(r.usado_gb) : "—"}</td>
+      <td>${pct != null
+        ? `<div style="display:flex;align-items:center;gap:8px">
+             <div class="pista" style="flex:1;height:6px"><i style="width:${Math.min(100,Math.max(0,pct))}%;
+               background:${colorDeUso(pct)}"></i></div>
+             <span class="num" style="font-size:11.5px;min-width:38px;text-align:right">${pct.toFixed(1)}%</span></div>`
+        : `<span style="font-size:11.5px;color:var(--soft)">${otras || "—"}</span>`}</td>
+      <td style="font-size:11px;color:var(--tenue)">${esc(hace(r.timestamp))}
+        ${r.origen === "SYNC" ? `<span class="tag sync" style="margin-left:5px">SYNC</span>` : ""}</td>
+    </tr>`;
+  }).join("") + "</tbody>";
+}
+
+/* -------------------------------------------------------------- bitácora */
+const CLASE_EV = {
+  ALTA_AUTOMATICA:"bueno", RECUPERADO:"bueno", CONEXION:"bueno",
+  NO_REPORTA:"malo", DESCONEXION:"malo",
+  SINCRONIZACION:"info", DISCO_AGREGADO:"info", CAMBIO_RECURSOS:"info", CAMBIO_INTERVALO:"info",
+  INTERMITENTE:"aviso", RELOJ_DESVIADO:"aviso", CAPACIDAD_CAMBIADA:"aviso", DISCO_REMOVIDO:"aviso",
+};
+function pintarBitacora(eventos){
+  const c = $("bitacora");
+  if (!eventos.length){ c.innerHTML = `<div class="vacio">Sin eventos todavía.</div>`; return; }
+  const donde = {};
+  nodos.forEach(n => donde[n.node_id] = n.sede || n.region);
+  c.innerHTML = eventos.map(e => `
+    <div class="ev ${CLASE_EV[e.tipo] || ""}">
+      <time class="num">${esc(fecha(e.timestamp))}</time>
+      <b>${esc(e.tipo.replace(/_/g," "))}</b>
+      <span><b style="color:var(--soft)">${esc(donde[e.node_id] || e.node_id)}</b> — ${esc(e.detalle || "")}</span>
+    </div>`).join("");
+}
+
+/* =========================================================================
+   MODALES
+   ========================================================================= */
+async function abrirDetalle(node_id){
+  nodoAbierto = node_id;
+  $("modalDetalleFondo").classList.add("visible");
+  refrescarDetalle(node_id);
+  $("detalleHistInfo").textContent = "cargando histórico…";
+  try{
+    const d = await pedir(`/api/history/${encodeURIComponent(node_id)}?horas=24&limite=300`);
+    const p = d.puntos || [];
+    const n = nodos.find(x => x.node_id === node_id) || {};
+    const color = n.estado === "ACTIVO" ? colorDeUso(Number(n.uso_pct ?? 0)) : C.mal;
+    $("detalleGrafico").innerHTML = p.length
+      ? miniLinea(p.map(x => Number(x.uso_pct ?? 0)), color, 360, 90,
+                  p.map(x => x.origen === "SYNC"))
+      : `<text x="180" y="48" fill="${C.tenue}" font-size="11" text-anchor="middle">Sin histórico todavía</text>`;
+    $("detalleHistInfo").innerHTML = p.length
+      ? `${p.length} mediciones en las últimas ${d.horas} h` +
+        (p.some(x => x.origen === "SYNC")
+          ? ` · <span style="color:#a3b0f2">los puntos marcados se recuperaron tras una caída</span>` : "")
+      : "sin histórico todavía";
+  }catch(e){ $("detalleHistInfo").textContent = "sin histórico todavía"; }
+}
+
+function refrescarDetalle(node_id){
+  const n = nodos.find(x => x.node_id === node_id);
+  if (!n) return;
+  const on = n.estado === "ACTIVO";
+  const pct = Number(n.uso_pct ?? 0);
+  $("detalleTitulo").innerHTML = `${esc(n.sede || n.region)}
+    <span class="estado ${on?"on":"off"}" style="margin-left:8px;vertical-align:middle">${
+      on?"ACTIVO":"NO REPORTA"}</span>`;
+  $("detalleSub").textContent =
+    `${n.region} (regional) · ${n.node_id} · ${n.hostname ?? "—"} · ${n.ip ?? "—"}`;
+  $("detalleBarra").style.width = Math.min(100, Math.max(0, pct)) + "%";
+  $("detalleBarra").style.background = on ? colorDeUso(pct) : C.apagado;
+  $("detalleUsado").textContent = `${gbExacto(n.usado_gb)} (${pct.toFixed(0)}%)`;
+  $("detalleLibre").textContent = gbExacto(n.libre_gb);
+
+  const filas = [
+    ["Departamento", n.region],
+    ["Sede", n.sede || n.region],
+    ["Sistema operativo", n.sistema_operativo ?? "—"],
+    ["Disco principal", `${n.disco_nombre ?? "—"} (${n.disco_tipo ?? "—"})`],
+    ["Capacidad", gbExacto(n.total_gb)],
+    ["Discos extra", Number(n.extra_disco_gb ?? 0) > 0 ? gbExacto(n.extra_disco_gb) : "ninguno"],
+    ["Agente", n.agente_version ?? "v1"],
+    ["Intervalo", `${n.intervalo_seg} s`],
+    ["Mide", n.recursos_pedidos || n.capacidades || "disco"],
+    ["Alta automática", fecha(n.primer_registro)],
+    ["Último reporte", `${fecha(n.ultimo_reporte)} (${hace(n.ultimo_reporte)})`],
+    ["Origen del dato", n.origen_ultima_metrica === "SYNC"
+        ? "recuperado del buffer del nodo" : "tiempo real"],
+    ["Sin sincronizar", `${n.pendientes_sync ?? 0} muestras`],
+    ["Caídas registradas", String(n.failover_events ?? 0)],
+    ["Cortes recientes", String(n.caidas_recientes ?? 0)],
+    ["Desvío de reloj", n.desvio_reloj_seg != null
+        ? `${Number(n.desvio_reloj_seg)>0?"+":""}${Number(n.desvio_reloj_seg).toFixed(1)} s — la métrica se fecha con la hora del servidor`
+        : "sin medir"],
+  ];
+  if (n.ultima_desconexion)
+    filas.push(["Se desconectó el", `${fechaLarga(n.ultima_desconexion)}${
+      n.motivo_desconexion ? " — " + n.motivo_desconexion : ""}`]);
+  if (n.ultima_reconexion) filas.push(["Volvió el", fechaLarga(n.ultima_reconexion)]);
+
+  $("detalleFicha").innerHTML = filas
+    .map(([k,v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join("");
+}
+
+const cerrarDetalle = () => { nodoAbierto = null;
+  $("modalDetalleFondo").classList.remove("visible"); };
+$("detalleCerrar").onclick = cerrarDetalle;
+$("modalDetalleFondo").onclick = e => { if (e.target.id === "modalDetalleFondo") cerrarDetalle(); };
+
+function abrirAcciones(node_id){
+  const n = nodos.find(x => x.node_id === node_id) || {};
+  $("destino").value = node_id;
+  $("modalNodoNombre").textContent =
+    `${n.sede || n.region} · ${n.region} (regional) · ${node_id}`;
+  $("intervalo").value = n.intervalo_seg ?? 10;
+  const activos = String(n.recursos_pedidos || n.capacidades || "disco").split(",");
+  $("checksRecursos").innerHTML = RECURSOS_POSIBLES.map(r =>
+    `<label><input type="checkbox" value="${r}" ${activos.includes(r)?"checked":""}> ${r}</label>`).join("");
+  eco("");
+  $("modalFondo").classList.add("visible");
+}
+const cerrarModal = () => $("modalFondo").classList.remove("visible");
+$("modalCerrar").onclick = cerrarModal;
+$("modalFondo").onclick = e => { if (e.target.id === "modalFondo") cerrarModal(); };
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape"){ cerrarModal(); cerrarDetalle(); ocultarGlobo(); }
 });
 
-cargar();
-reprogramar();
+const eco = (t, err) => { const e = $("eco"); e.className = err ? "error" : ""; e.textContent = t; };
+
+async function postear(ruta, cuerpo){
+  const r = await fetch(ruta, {method:"POST", headers:{"Content-Type":"application/json"},
+                              body: cuerpo === undefined ? "{}" : JSON.stringify(cuerpo)});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail ? JSON.stringify(d.detail) : `HTTP ${r.status}`);
+  return d;
+}
+
+// El ACK es un dato de UN mensaje, no del estado del clúster: no viaja por el
+// WebSocket. Se consulta hasta que aparezca, con tope.
+async function esperarAck(cmd_id){
+  const inicio = Date.now();
+  const iv = setInterval(async () => {
+    try{
+      const msg = (await pedir("/api/messages?limite=50")).find(m => m.cmd_id === cmd_id);
+      if (msg && msg.ack_en){
+        clearInterval(iv);
+        eco(`ACK recibido a las ${fecha(msg.ack_en)}` +
+            (msg.rtt_ms != null ? ` · ${msg.rtt_ms} ms de ida y vuelta` : ""));
+      } else if (msg && msg.estado === "FALLIDO"){
+        clearInterval(iv);
+        eco("No se pudo entregar: " + (msg.detalle || "el nodo no está conectado"), true);
+      } else if (Date.now() - inicio > 30000){
+        clearInterval(iv);
+        eco("Sin ACK después de 30 s. El nodo puede estar caído.", true);
+      }
+    }catch(e){}
+  }, 1500);
+}
+
+async function accion(boton, fn){
+  boton.disabled = true;
+  try { await fn(); } catch(e){ eco("No se pudo: " + e.message, true); }
+  finally { boton.disabled = false; }
+}
+
+$("enviar").onclick = function(){ accion(this, async () => {
+  eco("Enviando…");
+  const r = await postear("/api/message",
+    {node_id: $("destino").value, texto: $("texto").value});
+  eco(`Encolado ${String(r.cmd_id).slice(0,8)}… esperando ACK`);
+  esperarAck(r.cmd_id);
+});};
+
+$("guardarIntervalo").onclick = function(){ accion(this, async () => {
+  const seg = Number($("intervalo").value);
+  eco("Aplicando…");
+  const r = await postear(`/api/config/${encodeURIComponent($("destino").value)}`,
+                          {intervalo_seg: seg});
+  eco(`Intervalo → ${seg}s. Esperando ACK…`);
+  esperarAck(r.cmd_id);
+});};
+
+$("guardarRecursos").onclick = function(){ accion(this, async () => {
+  const rec = [...document.querySelectorAll("#checksRecursos input:checked")].map(c => c.value);
+  if (!rec.length){ eco("Elegí al menos un recurso.", true); return; }
+  eco("Aplicando…");
+  const r = await postear(`/api/resources/${encodeURIComponent($("destino").value)}`,
+                          {recursos: rec});
+  eco(`Ahora medirá: ${rec.join(", ")}. Esperando ACK…`);
+  esperarAck(r.cmd_id);
+});};
+
+$("forzarSync").onclick = function(){ accion(this, async () => {
+  eco("Pidiendo sincronización…");
+  const r = await postear(`/api/sync/${encodeURIComponent($("destino").value)}`);
+  eco("Sincronización pedida. Esperando ACK…");
+  esperarAck(r.cmd_id);
+});};
+
+/* =========================================================================
+   ARRANQUE
+   ========================================================================= */
+// Lo que cambia al segundo llega empujado. Lo que no —el histórico y las
+// mini-líneas, que son cientos de puntos y no se mueven de forma perceptible
+// entre un segundo y el siguiente— se pide aparte y más espaciado.
+async function cargarLento(){
+  await cargarHistorico();
+  try{
+    sparks = await pedir("/api/sparklines?horas=6&puntos=30");
+    if (nodos.length) pintarTarjetas();
+  }catch(e){}
+}
+
+$("refresco").onchange = () => { if (!modoWS) reprogramar(); };
+$("ventana").onchange = cargarHistorico;
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible"){
+    if (!modoWS){ cargarREST(); reprogramar(); }
+    cargarLento();
+  } else if (!modoWS){ clearInterval(timerPolling); timerPolling = null; }
+});
+
+cargarREST();          // pintar algo ya, sin esperar al socket
+conectarWS();
+cargarLento();
+timerLento = setInterval(cargarLento, 20000);
 </script>
 </body>
 </html>

@@ -27,6 +27,7 @@ Funciones agrupadas por quien las usa:
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -98,6 +99,11 @@ def _a_datetime(iso: str) -> datetime:
     viejo) se interpreta como UTC, que es la suposicion menos danina: adelanta
     el dato como mucho unas horas, en vez de esconderlo del filtro de tiempo.
     """
+    if isinstance(iso, datetime):
+        # v2: el servidor ya calculo la hora real a partir del reloj monotonico
+        # del cliente. Si viene con zona, se pasa a UTC; si no, ya es UTC.
+        return (iso.astimezone(timezone.utc).replace(tzinfo=None)
+                if iso.tzinfo else iso)
     try:
         dt = datetime.fromisoformat(iso)
     except (TypeError, ValueError):
@@ -111,14 +117,25 @@ def _a_datetime(iso: str) -> datetime:
 
 def registrar_nodo(node_id: str, region: str, hostname: str | None,
                    so: str | None, ip: str | None,
-                   intervalo: int) -> tuple[bool, int]:
+                   intervalo: int,
+                   sede: str | None = None,
+                   agente: str | None = None,
+                   capacidades: list[str] | None = None,
+                   desvio_reloj: float | None = None,
+                   pendientes: int = 0) -> tuple[bool, int, list[str]]:
     """
     Alta automatica de cliente — requisito 7.2 (vale 10%).
 
     Si el node_id no existe, lo inserta y deja el evento ALTA_AUTOMATICA.
     Si ya existia, actualiza sus datos y deja el evento CONEXION.
 
-    Devuelve (es_nuevo, intervalo_vigente).
+    Devuelve (es_nuevo, intervalo_vigente, recursos_que_debe_reportar).
+
+    v2: se guardan tambien la version del agente, que sabe medir ese nodo
+    (`capacidades`), cuanto miente su reloj y cuantas muestras trae pendientes
+    de sincronizar. `recursos_pedidos` es lo que el SERVIDOR quiere que mande:
+    en el alta se siembra con lo que el nodo dijo saber medir, y despues el
+    operador lo cambia desde el dashboard sin tocar esa maquina.
 
     ATOMICIDAD: es un solo INSERT ... ON DUPLICATE KEY UPDATE, no un SELECT
     seguido de un INSERT. Con dos hilos (un cliente que reconecta antes de que
@@ -142,24 +159,38 @@ def registrar_nodo(node_id: str, region: str, hostname: str | None,
     """
     node_id = _texto(node_id, _MAX_NODE_ID) or "SIN-ID"
     region = _texto(region, _MAX_REGION) or "Desconocida"
+    sede = _texto(sede, _MAX_REGION) or region
     hostname = _texto(hostname, _MAX_HOSTNAME)
     so = _texto(so, _MAX_SO)
     ip = _texto(ip, _MAX_IP)
     intervalo = config.acotar_intervalo(intervalo)
+    agente = _texto(agente, 32)
+    caps = _texto(",".join(str(c) for c in (capacidades or [])), _MAX_TEXTO)
+    desvio = None if desvio_reloj is None else round(float(desvio_reloj), 3)
 
     with cursor() as cur:
         cur.execute(
             """INSERT INTO nodos
-                   (node_id, region, hostname, sistema_operativo, ip,
-                    estado, intervalo_seg, ultimo_reporte)
-               VALUES (%s, %s, %s, %s, %s, 'ACTIVO', %s, NOW(3))
+                   (node_id, region, sede, hostname, sistema_operativo, ip,
+                    estado, intervalo_seg, ultimo_reporte,
+                    agente_version, capacidades, recursos_pedidos,
+                    ultima_reconexion, pendientes_sync, desvio_reloj_seg)
+               VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVO', %s, NOW(3),
+                       %s, %s, %s, NOW(3), %s, %s)
                ON DUPLICATE KEY UPDATE
                    region            = VALUES(region),
+                   sede              = VALUES(sede),
                    hostname          = VALUES(hostname),
                    sistema_operativo = VALUES(sistema_operativo),
                    ip                = VALUES(ip),
-                   ultimo_reporte    = NOW(3)""",
-            (node_id, region, hostname, so, ip, intervalo),
+                   ultimo_reporte    = NOW(3),
+                   ultima_reconexion = NOW(3),
+                   agente_version    = VALUES(agente_version),
+                   capacidades       = VALUES(capacidades),
+                   pendientes_sync   = VALUES(pendientes_sync),
+                   desvio_reloj_seg  = VALUES(desvio_reloj_seg)""",
+            (node_id, region, sede, hostname, so, ip, intervalo,
+             agente, caps, caps, int(pendientes), desvio),
         )
         es_nuevo = cur.rowcount == 1
 
@@ -171,11 +202,14 @@ def registrar_nodo(node_id: str, region: str, hostname: str | None,
               else f"Reconexion desde {ip}")),
         )
 
-        cur.execute("SELECT intervalo_seg FROM nodos WHERE node_id = %s", (node_id,))
+        cur.execute("SELECT intervalo_seg, recursos_pedidos FROM nodos "
+                    "WHERE node_id = %s", (node_id,))
         fila = cur.fetchone()
         vigente = int(fila["intervalo_seg"]) if fila else intervalo
+        pedidos = [r for r in (fila["recursos_pedidos"] or "").split(",")
+                   if r] if fila else []
 
-    return es_nuevo, vigente
+    return es_nuevo, vigente, (pedidos or list(config.RECURSOS_DEFECTO))
 
 
 def existe_nodo(node_id: str) -> bool:
@@ -206,7 +240,9 @@ def actualizar_intervalo(node_id: str, segundos: int) -> None:
 
 # ================================================================== METRICAS
 
-def guardar_metrica(node_id: str, timestamp: str, disco: dict) -> None:
+def guardar_metrica(node_id: str, timestamp, disco: dict,
+                    seq: int = 0, origen: str = "VIVO",
+                    t_cliente=None, tocar_reporte: bool = True) -> None:
     """
     Inserta UNA fila nueva. Nunca un UPDATE: la tabla es un historico.
     Ademas refresca nodos.ultimo_reporte, que es lo que mira el watchdog.
@@ -228,8 +264,9 @@ def guardar_metrica(node_id: str, timestamp: str, disco: dict) -> None:
             """INSERT INTO metricas
                    (node_id, timestamp, disco_nombre, disco_tipo,
                     total_gb, usado_gb, libre_gb, uso_pct,
-                    iops_lectura, iops_escritura, latencia_ms)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    iops_lectura, iops_escritura, latencia_ms,
+                    seq, origen, t_cliente)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 _texto(node_id, _MAX_NODE_ID),
                 _a_datetime(timestamp),
@@ -242,10 +279,372 @@ def guardar_metrica(node_id: str, timestamp: str, disco: dict) -> None:
                 _entero(disco.get("iops_lectura"), _MAX_IOPS),
                 _entero(disco.get("iops_escritura"), _MAX_IOPS),
                 _decimal(disco.get("latencia_ms"), _MAX_LATENCIA),
+                max(0, int(seq or 0)),
+                origen if origen in ("VIVO", "SYNC") else "VIVO",
+                _a_datetime(t_cliente) if t_cliente else None,
             ),
         )
-        cur.execute("UPDATE nodos SET ultimo_reporte = NOW(3) WHERE node_id = %s",
-                    (node_id,))
+        if tocar_reporte:
+            cur.execute(
+                "UPDATE nodos SET ultimo_reporte = NOW(3) WHERE node_id = %s",
+                (node_id,))
+
+
+# ================================================ RECURSOS FLEXIBLES  (v2)
+#
+# Todo lo que un nodo sabe medir y no es el primer disco: la RAM, la CPU, las
+# interfaces de red y los discos ADICIONALES (el pendrive que alguien enchufa
+# en la laptop de Santa Cruz). La gracia es que agregar una medida nueva no
+# obliga a tocar ni esta capa ni el esquema: el diccionario `metricas` entra
+# entero en una columna JSON, y MySQL materializa solo las tres medidas que se
+# consultan siempre (ver el comentario de la tabla en db/schema.sql).
+
+def guardar_recursos(node_id: str, timestamp, recursos: list[dict],
+                     seq: int = 0, origen: str = "VIVO") -> int:
+    """
+    Inserta de una vez todos los recursos de UNA muestra. Devuelve cuantos.
+
+    executemany y no un execute por recurso: un nodo que reporta disco + 2
+    particiones + RAM + CPU + red son seis viajes de ida y vuelta a MySQL cada
+    diez segundos, por nueve nodos. Contra Aiven eso solo ya es medio segundo
+    de red por ciclo.
+    """
+    if not recursos:
+        return 0
+    momento = _a_datetime(timestamp)
+    origen = origen if origen in ("VIVO", "SYNC") else "VIVO"
+    filas = []
+    for r in recursos:
+        tipo = _texto(r.get("tipo"), 16, protocolo.REC_CUSTOM)
+        if tipo not in protocolo.TIPOS_RECURSO:
+            tipo = protocolo.REC_CUSTOM
+        nombre = _texto(r.get("nombre"), _MAX_DISCO)
+        if not nombre:
+            continue
+        metricas = r.get("metricas") or {}
+        etiquetas = r.get("etiquetas") or {}
+        if not isinstance(metricas, dict) or not isinstance(etiquetas, dict):
+            continue
+        filas.append((
+            _texto(node_id, _MAX_NODE_ID), momento, tipo, nombre,
+            json.dumps(metricas, ensure_ascii=False),
+            json.dumps(etiquetas, ensure_ascii=False) if etiquetas else None,
+            origen, max(0, int(seq or 0)),
+        ))
+    if not filas:
+        return 0
+    with cursor() as cur:
+        cur.executemany(
+            """INSERT INTO recursos
+                   (node_id, timestamp, tipo, nombre, metricas, etiquetas,
+                    origen, seq)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            filas,
+        )
+    return len(filas)
+
+
+def ultima_seq(node_id: str) -> int:
+    """Ultimo numero de muestra que el servidor acepto de este nodo."""
+    with cursor() as cur:
+        cur.execute("SELECT ultima_seq FROM nodos WHERE node_id = %s", (node_id,))
+        fila = cur.fetchone()
+        return int(fila["ultima_seq"]) if fila else 0
+
+
+def guardar_lote(node_id: str, muestras: list[dict]) -> tuple[int, int]:
+    """
+    SINCRONIZACION TRAS UNA CAIDA — el corazon del requisito nuevo.
+
+    `muestras` ya viene FECHADA POR EL SERVIDOR: cada elemento trae
+    {seq, timestamp (datetime), t_cliente, disco, recursos}. Aqui no se
+    interpreta ninguna hora del cliente.
+
+    Devuelve (insertadas, descartadas_por_duplicadas).
+
+    IDEMPOTENCIA: se descarta todo lo que tenga seq <= nodos.ultima_seq. Si el
+    cliente no recibio el SYNC_OK y reenvia el mismo lote, la segunda vez no
+    entra ninguna fila. Sin esto, una reconexion con mala suerte duplica horas
+    de historico y el growth rate sale al doble.
+
+    El avance de ultima_seq va con la condicion en el WHERE, no leyendo antes:
+    dos hilos del mismo nodo (el viejo que aun no murio y el nuevo) no pueden
+    hacerlo retroceder.
+    """
+    if not muestras:
+        return 0, 0
+
+    tope = ultima_seq(node_id)
+    nuevas = [m for m in muestras if int(m.get("seq") or 0) > tope]
+    descartadas = len(muestras) - len(nuevas)
+    if not nuevas:
+        return 0, descartadas
+
+    filas_metricas = []
+    for m in nuevas:
+        d = m.get("disco") or {}
+        tipo = _texto(d.get("tipo"), 16, protocolo.TIPO_DESCONOCIDO)
+        if tipo not in protocolo.TIPOS_DISCO:
+            tipo = protocolo.TIPO_DESCONOCIDO
+        filas_metricas.append((
+            _texto(node_id, _MAX_NODE_ID),
+            _a_datetime(m.get("timestamp")),
+            _texto(d.get("nombre"), _MAX_DISCO),
+            tipo,
+            _decimal(d.get("total_gb"), _MAX_GB),
+            _decimal(d.get("usado_gb"), _MAX_GB),
+            _decimal(d.get("libre_gb"), _MAX_GB),
+            _decimal(d.get("uso_pct"), _MAX_PCT),
+            _entero(d.get("iops_lectura"), _MAX_IOPS),
+            _entero(d.get("iops_escritura"), _MAX_IOPS),
+            _decimal(d.get("latencia_ms"), _MAX_LATENCIA),
+            max(0, int(m.get("seq") or 0)),
+            "SYNC",
+            _a_datetime(m["t_cliente"]) if m.get("t_cliente") else None,
+        ))
+
+    with cursor() as cur:
+        cur.executemany(
+            """INSERT INTO metricas
+                   (node_id, timestamp, disco_nombre, disco_tipo,
+                    total_gb, usado_gb, libre_gb, uso_pct,
+                    iops_lectura, iops_escritura, latencia_ms,
+                    seq, origen, t_cliente)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            filas_metricas,
+        )
+
+    for m in nuevas:
+        guardar_recursos(node_id, m.get("timestamp"), m.get("recursos") or [],
+                         seq=int(m.get("seq") or 0), origen="SYNC")
+
+    mayor = max(int(m.get("seq") or 0) for m in nuevas)
+    with cursor() as cur:
+        cur.execute(
+            """UPDATE nodos
+                  SET ultima_seq     = %s,
+                      ultimo_reporte = NOW(3)
+                WHERE node_id = %s AND ultima_seq < %s""",
+            (mayor, node_id, mayor),
+        )
+    return len(nuevas), descartadas
+
+
+def avanzar_seq(node_id: str, seq: int) -> None:
+    """Avanza el contador tras una metrica EN VIVO (no un lote)."""
+    seq = max(0, int(seq or 0))
+    if seq <= 0:
+        return
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE nodos SET ultima_seq = %s WHERE node_id = %s AND ultima_seq < %s",
+            (seq, node_id, seq),
+        )
+
+
+def recursos_actuales(node_id: str | None = None) -> list[dict[str, Any]]:
+    """Ultima medicion de cada recurso. Alimenta el panel de RAM/CPU/discos."""
+    sql = """SELECT node_id, tipo, nombre, timestamp, metricas, etiquetas,
+                    origen, total_gb, usado_gb, uso_pct
+               FROM v_recursos_ultimo"""
+    params: tuple = ()
+    if node_id:
+        sql += " WHERE node_id = %s"
+        params = (node_id,)
+    sql += " ORDER BY node_id, tipo, nombre"
+    with cursor() as cur:
+        cur.execute(sql, params)
+        filas = cur.fetchall()
+    # El driver devuelve las columnas JSON ya como dict cuando puede, y como
+    # texto cuando la version del conector no lo hace. Se normaliza aqui para
+    # que la API no tenga que preguntarse cual de las dos le toco.
+    for f in filas:
+        for campo in ("metricas", "etiquetas"):
+            valor = f.get(campo)
+            if isinstance(valor, (str, bytes, bytearray)):
+                try:
+                    f[campo] = json.loads(valor)
+                except (ValueError, TypeError):
+                    f[campo] = {}
+            elif valor is None:
+                f[campo] = {}
+    return filas
+
+
+def historial_recurso(node_id: str, tipo: str, nombre: str,
+                      horas: int = 24, limite: int = 500) -> list[dict[str, Any]]:
+    """Serie temporal de UN recurso concreto (la RAM de un nodo, por ejemplo).
+
+    Mismo cuidado con el orden que en historial(): se toman los `limite` mas
+    NUEVOS y despues se reordenan para dibujar."""
+    with cursor() as cur:
+        cur.execute(
+            """SELECT * FROM (
+                   SELECT timestamp, total_gb, usado_gb, uso_pct, origen
+                     FROM recursos
+                    WHERE node_id = %s AND tipo = %s AND nombre = %s
+                      AND timestamp >= NOW() - INTERVAL %s HOUR
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT %s
+               ) AS ultimos ORDER BY ultimos.timestamp ASC""",
+            (node_id, tipo, nombre, horas, limite),
+        )
+        return cur.fetchall()
+
+
+def actualizar_recursos_pedidos(node_id: str, recursos: list[str]) -> None:
+    """Requisito de flexibilidad: el operador decide QUE mide cada nodo, desde
+    el dashboard, sin entrar a esa maquina."""
+    texto = _texto(",".join(str(r).strip().lower() for r in recursos), _MAX_TEXTO)
+    with cursor() as cur:
+        cur.execute("UPDATE nodos SET recursos_pedidos = %s WHERE node_id = %s",
+                    (texto, node_id))
+        cur.execute(
+            "INSERT INTO eventos (node_id, tipo, detalle) "
+            "VALUES (%s, 'CAMBIO_RECURSOS', %s)",
+            (node_id, f"Recursos a reportar: {texto}"),
+        )
+
+
+def actualizar_pendientes(node_id: str, cantidad: int) -> None:
+    """Cuantas muestras le quedan al nodo sin sincronizar. El dashboard lo
+    muestra como 'recuperando N muestras'."""
+    with cursor() as cur:
+        cur.execute("UPDATE nodos SET pendientes_sync = %s WHERE node_id = %s",
+                    (max(0, int(cantidad)), node_id))
+
+
+def guardar_desvio_reloj(node_id: str, desvio_seg: float) -> None:
+    """
+    Deja constancia de que ese nodo tiene la hora cambiada.
+
+    NO corrige nada ni rechaza el dato: la metrica ya se guardo con la hora del
+    servidor. Esto es para el operador, que necesita saber que esa maquina
+    tiene el reloj mal antes de que alguien mire un log suyo y se confunda.
+    """
+    with cursor() as cur:
+        cur.execute("UPDATE nodos SET desvio_reloj_seg = %s WHERE node_id = %s",
+                    (round(float(desvio_seg), 3), node_id))
+        cur.execute(
+            "INSERT INTO eventos (node_id, tipo, detalle) "
+            "VALUES (%s, 'RELOJ_DESVIADO', %s)",
+            (node_id, f"El reloj del nodo difiere {desvio_seg:+.1f} s del servidor; "
+                      f"se usa la hora del servidor"),
+        )
+
+
+# ====================================== DESCONEXION E INTERMITENCIA  (v2)
+
+def registrar_desconexion(node_id: str, motivo: str) -> None:
+    """
+    "Se desconecto de la red el ..." — con fecha y con motivo.
+
+    Antes esto solo existia como una fila mas en `eventos` y el dashboard no
+    tenia de donde sacarlo sin recorrer la bitacora. Ahora queda tambien en la
+    fila del nodo, que es una lectura por clave primaria.
+
+    caidas_recientes se incrementa aqui y lo reinicia el watchdog cuando pasa
+    la ventana: es lo que distingue "se cayo" de "se esta cayendo todo el rato".
+    """
+    motivo = _texto(motivo, _MAX_TEXTO) or "Conexion cerrada"
+    with cursor() as cur:
+        cur.execute(
+            """UPDATE nodos
+                  SET ultima_desconexion = NOW(3),
+                      motivo_desconexion = %s,
+                      caidas_recientes   = LEAST(caidas_recientes + 1, 60000)
+                WHERE node_id = %s""",
+            (motivo, node_id),
+        )
+        cur.execute(
+            "INSERT INTO eventos (node_id, tipo, detalle) VALUES (%s, 'DESCONEXION', %s)",
+            (node_id, motivo),
+        )
+
+
+def marcar_intermitentes(ventana_min: int, umbral: int) -> list[str]:
+    """
+    Un nodo que se cae y vuelve N veces en la ventana esta fallando de forma
+    INTERMITENTE, que es un problema distinto a estar caido.
+
+    Se cuenta sobre `eventos` y no sobre el contador de la fila porque la
+    ventana tiene que deslizarse: si no, un nodo que tuvo tres cortes ayer
+    quedaria marcado para siempre.
+
+    Devuelve los que ACABAN de cambiar de estado, para poder loguearlos una
+    sola vez en vez de en cada ciclo del watchdog.
+    """
+    ventana_min = max(1, int(ventana_min))
+    umbral = max(2, int(umbral))
+    nuevos: list[str] = []
+    with cursor() as cur:
+        cur.execute(
+            """SELECT n.node_id, n.intermitente,
+                      (SELECT COUNT(*) FROM eventos e
+                        WHERE e.node_id = n.node_id
+                          AND e.tipo IN ('DESCONEXION','NO_REPORTA')
+                          AND e.timestamp >= NOW() - INTERVAL %s MINUTE) AS caidas
+                 FROM nodos n""",
+            (ventana_min,),
+        )
+        filas = cur.fetchall()
+
+        for f in filas:
+            debe = 1 if int(f["caidas"]) >= umbral else 0
+            if debe == int(f["intermitente"] or 0):
+                cur.execute(
+                    "UPDATE nodos SET caidas_recientes = %s WHERE node_id = %s",
+                    (int(f["caidas"]), f["node_id"]))
+                continue
+            cur.execute(
+                "UPDATE nodos SET intermitente = %s, caidas_recientes = %s "
+                "WHERE node_id = %s",
+                (debe, int(f["caidas"]), f["node_id"]))
+            if debe:
+                cur.execute(
+                    "INSERT INTO eventos (node_id, tipo, detalle) "
+                    "VALUES (%s, 'INTERMITENTE', %s)",
+                    (f["node_id"],
+                     f"{f['caidas']} cortes en los ultimos {ventana_min} min"))
+                nuevos.append(f["node_id"])
+    return nuevos
+
+
+def listar_regionales() -> list[dict[str, Any]]:
+    """
+    Consolidado POR REGIONAL, no por maquina.
+
+    Existe porque el enunciado habla de nueve administraciones regionales, y La
+    Paz tiene DOS servidores. "Cuanto almacenamiento tiene La Paz" es la suma
+    de sus dos nodos, no la de uno.
+    """
+    with cursor() as cur:
+        cur.execute("SELECT * FROM v_regionales ORDER BY region")
+        return cur.fetchall()
+
+
+def ultima_metrica_de(node_id: str) -> dict[str, Any] | None:
+    """La ultima medicion del primer disco de un nodo. La usa el servidor para
+    detectar que la capacidad cambio (un disco que crecio, un pendrive)."""
+    with cursor() as cur:
+        cur.execute("SELECT * FROM v_ultima_metrica WHERE node_id = %s", (node_id,))
+        return cur.fetchone()
+
+
+def discos_conocidos(node_id: str) -> dict[str, float]:
+    """
+    Que unidades se le vieron por ultima vez a este nodo, con su capacidad.
+
+    Es contra esto que el servidor compara cada muestra para detectar que
+    enchufaron un pendrive (DISCO_AGREGADO), que lo sacaron (DISCO_REMOVIDO) o
+    que una unidad cambio de tamano (CAPACIDAD_CAMBIADA).
+    """
+    with cursor() as cur:
+        cur.execute(
+            """SELECT nombre, total_gb FROM v_recursos_ultimo
+                WHERE node_id = %s AND tipo = 'DISCO'""",
+            (node_id,))
+        return {f["nombre"]: float(f["total_gb"] or 0) for f in cur.fetchall()}
 
 
 # ================================================================== WATCHDOG
@@ -279,8 +678,18 @@ def marcar_nodos_caidos(factor_timeout: int) -> list[str]:
         candidatos = [f["node_id"] for f in cur.fetchall()]
 
         for node_id in candidatos:
+            # v2: la caida silenciosa (cable cortado, wifi caido) tambien
+            # tiene que dejar la FECHA de desconexion en la fila del nodo. Sin
+            # esto, el dashboard solo puede decir "no reporta" y no "se
+            # desconecto de la red el jueves a las 14:32".
             cur.execute(
-                """UPDATE nodos SET estado = 'NO_REPORTA'
+                """UPDATE nodos
+                      SET estado = 'NO_REPORTA',
+                          ultima_desconexion = COALESCE(ultima_desconexion,
+                                                        ultimo_reporte, NOW(3)),
+                          motivo_desconexion = COALESCE(motivo_desconexion,
+                              'Dejo de reportar (sin cierre de conexion)'),
+                          caidas_recientes = LEAST(caidas_recientes + 1, 60000)
                     WHERE node_id = %s
                       AND estado = 'ACTIVO'
                       AND TIMESTAMPDIFF(SECOND, ultimo_reporte, NOW())
@@ -319,7 +728,10 @@ def marcar_nodos_recuperados(factor_timeout: int) -> list[str]:
 
         for node_id in candidatos:
             cur.execute(
-                """UPDATE nodos SET estado = 'ACTIVO'
+                """UPDATE nodos
+                      SET estado = 'ACTIVO',
+                          ultima_reconexion = NOW(3),
+                          motivo_desconexion = NULL
                     WHERE node_id = %s
                       AND estado = 'NO_REPORTA'
                       AND TIMESTAMPDIFF(SECOND, ultimo_reporte, NOW())
@@ -513,6 +925,117 @@ def crecimiento(horas: int = 24) -> list[dict[str, Any]]:
         })
     resultado.sort(key=lambda r: r["node_id"])
     return resultado
+
+
+def _tamano_bucket(horas: int, puntos: int) -> int:
+    """
+    Segundos por punto para que una ventana de `horas` entre en `puntos`.
+
+    Sin agrupar, 24 h de 10 nodos cada 10 s son 86.400 filas: el navegador
+    tendria que dibujar 86.400 segmentos para una linea de 800 pixeles de
+    ancho. Se agrupa en el servidor, que es donde estan los datos.
+    """
+    return max(30, int(horas * 3600 / max(10, puntos)))
+
+
+def historial_cluster(horas: int = 24, puntos: int = 120) -> list[dict[str, Any]]:
+    """
+    Utilizacion GLOBAL del cluster en el tiempo: una sola serie.
+
+    POR QUE UNA Y NO DIEZ
+    La version anterior dibujaba una linea por nodo en el mismo grafico. Con
+    diez nodos eso es un plato de espaguetis: los colores dejan de
+    distinguirse, y la pregunta que el grafico tiene que responder —"esta
+    subiendo el uso del cluster?"— no se lee. Ahora el grafico grande muestra
+    el total, y cada nodo tiene su propia mini-linea en su tarjeta.
+
+    POR QUE PROMEDIO POR NODO Y DESPUES SUMA
+    Dentro de un bucket un nodo puede haber reportado tres veces y otro una.
+    Sumar directo contaria al primero tres veces y la capacidad del cluster
+    daria el triple. Se promedia por nodo dentro del bucket y recien despues
+    se suma entre nodos.
+    """
+    seg = _tamano_bucket(horas, puntos)
+    with cursor() as cur:
+        cur.execute(
+            """SELECT t,
+                      ROUND(SUM(usado), 2) AS usado_gb,
+                      ROUND(SUM(total), 2) AS total_gb,
+                      COUNT(*)             AS nodos
+                 FROM (SELECT node_id,
+                              FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(timestamp) / %s) * %s) AS t,
+                              AVG(usado_gb) AS usado,
+                              AVG(total_gb) AS total
+                         FROM metricas
+                        WHERE timestamp >= NOW() - INTERVAL %s HOUR
+                        GROUP BY node_id, t) AS por_nodo
+                GROUP BY t
+                ORDER BY t""",
+            (seg, seg, horas),
+        )
+        filas = cur.fetchall()
+    for f in filas:
+        total = float(f["total_gb"] or 0)
+        f["uso_pct"] = round(float(f["usado_gb"] or 0) / total * 100, 2) if total else 0.0
+    return filas
+
+
+def sparklines(horas: int = 6, puntos: int = 30) -> dict[str, list[float]]:
+    """
+    Una mini-serie de utilizacion por nodo, para dibujarla dentro de su tarjeta.
+
+    Una sola consulta para todos los nodos. La alternativa —un GET por nodo
+    desde el navegador— eran diez peticiones cada vez que se refresca, y con
+    tres pantallas abiertas, treinta.
+    """
+    seg = _tamano_bucket(horas, puntos)
+    with cursor() as cur:
+        cur.execute(
+            """SELECT node_id,
+                      FLOOR(UNIX_TIMESTAMP(timestamp) / %s) AS bucket,
+                      ROUND(AVG(uso_pct), 2) AS pct
+                 FROM metricas
+                WHERE timestamp >= NOW() - INTERVAL %s HOUR
+                GROUP BY node_id, bucket
+                ORDER BY node_id, bucket""",
+            (seg, horas),
+        )
+        filas = cur.fetchall()
+    salida: dict[str, list[float]] = {}
+    for f in filas:
+        salida.setdefault(f["node_id"], []).append(float(f["pct"] or 0))
+    return salida
+
+
+def distribucion_uso(tramos: int = 5,
+                     nodos: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """
+    Histograma: cuantos nodos hay en cada tramo de utilizacion.
+
+    Responde de un vistazo algo que la lista de tarjetas no responde: "esta el
+    cluster equilibrado, o hay unos pocos nodos llenos y el resto vacios?".
+    Con nueve regionales eso decide si hace falta comprar discos o mover datos.
+
+    El calculo es en Python y no en SQL a proposito: son diez filas, ya estan
+    en memoria por listar_nodos(), y en SQL habria que meter un CASE de cinco
+    ramas que hay que tocar cada vez que alguien quiera otro tramo.
+
+    `nodos` permite pasar la lista ya leida. La difusion por WebSocket la lee
+    una vez por ciclo: sin este parametro, calcular el histograma duplicaria
+    esa consulta cada segundo, para todos los navegadores.
+    """
+    ancho = 100 / max(1, tramos)
+    cubos = [{"desde": round(i * ancho), "hasta": round((i + 1) * ancho),
+              "nodos": 0, "node_ids": []} for i in range(tramos)]
+    for n in (listar_nodos() if nodos is None else nodos):
+        if n.get("uso_pct") is None or n.get("estado") != "ACTIVO":
+            continue
+        pct = float(n["uso_pct"])
+        # El 100% cae en el ultimo tramo, no en uno inexistente.
+        i = min(tramos - 1, int(pct / ancho))
+        cubos[i]["nodos"] += 1
+        cubos[i]["node_ids"].append(n["node_id"])
+    return cubos
 
 
 def disponibilidad(horas: int = 24) -> list[dict[str, Any]]:

@@ -115,7 +115,7 @@ def matar_abrupto(p: subprocess.Popen) -> None:
 def proc_de(node_id: str) -> subprocess.Popen:
     return next(
         p for p in _procesos
-        if p.poll() is None and node_id in " ".join(p.args))  # type: ignore[arg-type]
+        if p.poll() is None and node_id in " ".join(p.args)  # type: ignore[arg-type]
     )
 
 

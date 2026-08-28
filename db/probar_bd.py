@@ -8,11 +8,13 @@ Que verifica:
   1. Conexion y version de MySQL
   2. Que las 4 tablas, las 3 vistas y los indices existan
   3. Alta automatica: un nodo nuevo se inserta solo y deja su evento
-  4. CONCURRENCIA REAL: 9 hilos escribiendo metricas al mismo tiempo
+  4. CONCURRENCIA REAL: un hilo por nodo de config.REGIONALES, todos a la vez
   5. Watchdog: caida y recuperacion, con sus eventos
   6. Ciclo de mensaje: PENDIENTE -> ENVIADO -> CONFIRMADO
   7. Saneado: datos basura del cliente no rompen el INSERT
   8. Las consultas de agregacion devuelven numeros coherentes
+  9. v2: recursos flexibles (RAM/CPU/pendrive), sincronizacion idempotente,
+     desconexion con fecha, desvio de reloj y dos servidores por regional
 
 Todo lo que crea usa el prefijo TEST- y se borra al final, PASE LO QUE PASE
 (hay un try/finally en main). Importa: la base de Aiven es compartida por los
@@ -47,8 +49,13 @@ def check(nombre: str, condicion: bool, detalle: str = "") -> None:
 
 def _alta(node_id: str, region: str = "Regional de prueba",
           intervalo: int = INTERVALO_PRUEBA) -> tuple[bool, int]:
-    return repo.registrar_nodo(node_id, region, f"host-{node_id}", "Linux",
-                               "192.168.1.50", intervalo)
+    # v2: registrar_nodo devuelve ademas los recursos que el servidor le pide
+    # al nodo. Aqui no interesa: se descarta para no tocar los 40 usos de esta
+    # funcion en el resto del archivo.
+    nuevo, vigente, _recursos = repo.registrar_nodo(
+        node_id, region, f"host-{node_id}", "Linux", "192.168.1.50", intervalo,
+        agente="2.0.0-test", capacidades=["disco", "ram", "cpu"])
+    return nuevo, vigente
 
 
 def _metrica(usado: float = 200.0, total: float = 500.0, **extra) -> dict:
@@ -84,10 +91,35 @@ def prueba_estructura() -> None:
     check("MySQL 8.0.14 o superior (las vistas lo necesitan)",
           numeros >= (8, 0, 14), version)
 
-    for t in ("nodos", "metricas", "eventos", "mensajes"):
+    # v2: la tabla `recursos` y las vistas v_recursos_ultimo / v_regionales.
+    for t in ("nodos", "metricas", "eventos", "mensajes", "recursos"):
         check(f"Tabla {t}", t in nombres)
-    for v in ("v_ultima_metrica", "v_nodos_estado", "v_cluster"):
+    for v in ("v_ultima_metrica", "v_nodos_estado", "v_cluster",
+              "v_recursos_ultimo", "v_regionales"):
         check(f"Vista {v}", v in nombres)
+
+    # Las columnas generadas de `recursos` son lo que hace consultable el JSON.
+    # Si faltan, la base quedo en v1 y hay que correr db/migracion_v2.sql.
+    with cursor() as cur:
+        cur.execute("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'recursos'
+                          AND EXTRA LIKE '%GENERATED%'""")
+        generadas = {f["COLUMN_NAME"] for f in cur.fetchall()}
+    check("recursos tiene las columnas generadas desde el JSON",
+          {"total_gb", "usado_gb", "uso_pct"} <= generadas,
+          ", ".join(sorted(generadas)) or "ninguna")
+
+    with cursor() as cur:
+        cur.execute("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'nodos'""")
+        cols = {f["COLUMN_NAME"] for f in cur.fetchall()}
+    faltan_v2 = {"ultima_desconexion", "motivo_desconexion", "intermitente",
+                 "ultima_seq", "desvio_reloj_seg"} - cols
+    check("nodos tiene las columnas de la v2",
+          not faltan_v2,
+          f"faltan {', '.join(sorted(faltan_v2))} -> corre db/migracion_v2.sql"
+          if faltan_v2 else "")
 
     with cursor() as cur:
         cur.execute("SHOW INDEX FROM metricas WHERE Key_name = 'ix_nodo_tiempo'")
@@ -173,7 +205,9 @@ def ids_prueba() -> list[str]:
 
 
 def prueba_concurrencia() -> None:
-    print(f"\n4. Concurrencia: 9 hilos escribiendo {SEGUNDOS_CARGA} s")
+    ids = ids_prueba()
+    n_hilos = len(ids)
+    print(f"\n4. Concurrencia: {n_hilos} hilos escribiendo {SEGUNDOS_CARGA} s")
 
     # Cuanto tarda un viaje a la base define TODO lo que sigue. Contra MySQL
     # local son milisegundos; contra Aiven son cientos, y en ese caso nueve
@@ -186,7 +220,6 @@ def prueba_concurrencia() -> None:
         print("      Contra la nube esta prueba mide la RED, no el codigo.")
         print("      La prueba de carga larga (10 min) hacela contra MySQL local.")
 
-    ids = ids_prueba()
     marcadores = ",".join(["%s"] * len(ids))
 
     with cursor() as cur:
@@ -219,8 +252,11 @@ def prueba_concurrencia() -> None:
         insertadas = cur.fetchone()["c"] - antes
 
     escribieron = len(por_nodo)
-    check("Los 9 hilos escribieron en paralelo", escribieron == 9,
-          f"{escribieron}/9 nodos con metricas")
+    # El numero sale de config.REGIONALES, NO escrito a mano: al agregar el
+    # segundo servidor de La Paz la lista paso a diez y un 9 fijo aqui hacia
+    # fallar una prueba que en realidad estaba pasando.
+    check(f"Los {n_hilos} hilos escribieron en paralelo", escribieron == n_hilos,
+          f"{escribieron}/{n_hilos} nodos con metricas")
     check("Sin datos cruzados entre nodos", set(por_nodo) == set(ids))
 
     with cursor() as cur:
@@ -232,12 +268,13 @@ def prueba_concurrencia() -> None:
     # guardar_metrica son 2 consultas; el ciclo de cada hilo es el intervalo
     # mas esos dos viajes.
     ciclo = INTERVALO_PRUEBA + (2 * lat / 1000)
-    esperadas = max(1, int(9 * SEGUNDOS_CARGA / ciclo))
+    esperadas = max(1, int(n_hilos * SEGUNDOS_CARGA / ciclo))
     check("Rendimiento acorde a la latencia medida",
           insertadas >= esperadas * 0.6,
           f"{insertadas} filas en {SEGUNDOS_CARGA}s = "
           f"{insertadas / SEGUNDOS_CARGA:.1f}/s (esperado ~{esperadas})")
-    print("      De referencia: en produccion son 9 nodos cada 10 s = 0.9 filas/s")
+    print(f"      De referencia: en produccion son {n_hilos} nodos cada 10 s = "
+          f"{n_hilos / 10:.1f} filas/s")
 
 
 # ------------------------------------------------------------------------- 5
@@ -433,6 +470,139 @@ def prueba_agregaciones() -> None:
 
 # ------------------------------------------------------------------- limpieza
 
+def prueba_v2_recursos_y_sync() -> None:
+    """
+    9. Lo nuevo de la version 2: recursos flexibles, sincronizacion idempotente,
+       hora puesta por el servidor, desconexion con fecha y consolidado por
+       regional.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    print("\n9. Version 2: recursos flexibles, sincronizacion y regionales")
+    node_id = f"{PREFIJO}V2-{random.randint(1000, 9999)}"
+    _alta(node_id, region=f"{PREFIJO}Regional Dos")
+
+    # --- recursos flexibles: RAM y un disco USB ------------------------------
+    ahora = datetime.now(timezone.utc)
+    guardados = repo.guardar_recursos(node_id, ahora, [
+        {"tipo": "RAM", "nombre": "fisica",
+         "metricas": {"total_gb": 16.0, "usado_gb": 9.5, "uso_pct": 59.4},
+         "etiquetas": {"unidad": "GB"}},
+        {"tipo": "DISCO", "nombre": "E:\\",
+         "metricas": {"total_gb": 28.8, "usado_gb": 4.0, "uso_pct": 13.9},
+         "etiquetas": {"removible": "si", "tipo": "USB"}},
+        {"tipo": "CPU", "nombre": "total",
+         "metricas": {"uso_pct": 23.5, "nucleos": 8, "temperatura_c": 41.2}},
+    ])
+    check("guardar_recursos inserta los 3 recursos", guardados == 3, str(guardados))
+
+    actuales = repo.recursos_actuales(node_id)
+    check("recursos_actuales devuelve los 3", len(actuales) == 3, str(len(actuales)))
+
+    ram = next((r for r in actuales if r["tipo"] == "RAM"), None)
+    check("La RAM llega como diccionario, no como texto JSON",
+          isinstance(ram and ram["metricas"], dict))
+    check("Las columnas generadas se calcularon desde el JSON",
+          ram is not None and abs(float(ram["total_gb"]) - 16.0) < 0.01,
+          str(ram and ram["total_gb"]))
+
+    cpu = next((r for r in actuales if r["tipo"] == "CPU"), None)
+    check("Una metrica NO prevista (temperatura_c) se guarda igual",
+          cpu is not None and "temperatura_c" in (cpu["metricas"] or {}))
+    check("Un recurso sin capacidad deja total_gb en NULL",
+          cpu is not None and cpu["total_gb"] is None)
+
+    # --- el pendrive suma capacidad al nodo, no al KPI del primer disco ------
+    repo.guardar_metrica(node_id, ahora, _metrica(usado=100.0, total=500.0))
+    fila = next((n for n in repo.listar_nodos() if n["node_id"] == node_id), None)
+    check("extra_disco_gb suma el disco adicional (pendrive)",
+          fila is not None and abs(float(fila["extra_disco_gb"]) - 28.8) < 0.05,
+          str(fila and fila["extra_disco_gb"]))
+    check("total_gb sigue siendo SOLO el primer disco (enunciado)",
+          fila is not None and abs(float(fila["total_gb"]) - 500.0) < 0.01,
+          str(fila and fila["total_gb"]))
+
+    # --- sincronizacion: idempotente y fechada por el servidor ---------------
+    base_seq = repo.ultima_seq(node_id)
+    lote = [{
+        "seq": base_seq + i + 1,
+        # El servidor ya calculo estas horas: son de hace 10, 8 y 6 minutos.
+        "timestamp": ahora - timedelta(minutes=10 - i * 2),
+        "t_cliente": None,
+        "disco": _metrica(usado=110.0 + i),
+        "recursos": [],
+    } for i in range(3)]
+
+    ins, dup = repo.guardar_lote(node_id, lote)
+    check("guardar_lote inserta las 3 muestras atrasadas", ins == 3, f"{ins}/{dup}")
+
+    ins2, dup2 = repo.guardar_lote(node_id, lote)
+    check("Reenviar el MISMO lote no duplica nada (idempotencia)",
+          ins2 == 0 and dup2 == 3, f"{ins2}/{dup2}")
+
+    with cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM metricas "
+                    "WHERE node_id=%s AND origen='SYNC'", (node_id,))
+        sync = int(cur.fetchone()["n"])
+    check("Las recuperadas quedan marcadas origen=SYNC", sync == 3, str(sync))
+
+    puntos = repo.historial(node_id, horas=1, limite=50)
+    check("Las muestras atrasadas quedan REPARTIDAS en el tiempo, no apiladas",
+          len(puntos) >= 4 and puntos[0]["timestamp"] != puntos[-1]["timestamp"])
+
+    check("ultima_seq avanzo hasta la ultima aceptada",
+          repo.ultima_seq(node_id) == base_seq + 3, str(repo.ultima_seq(node_id)))
+
+    # Un lote viejo (seq ya visto) no puede hacer retroceder el contador.
+    repo.guardar_lote(node_id, [{"seq": base_seq, "timestamp": ahora,
+                                 "t_cliente": None, "disco": _metrica(),
+                                 "recursos": []}])
+    check("Un lote con seq viejo no hace retroceder ultima_seq",
+          repo.ultima_seq(node_id) == base_seq + 3)
+
+    # --- desconexion con fecha y motivo --------------------------------------
+    repo.registrar_desconexion(node_id, "Cable desconectado (prueba)")
+    fila = next((n for n in repo.listar_nodos() if n["node_id"] == node_id), None)
+    check("La desconexion queda con FECHA en la fila del nodo",
+          fila is not None and fila["ultima_desconexion"] is not None)
+    check("Y con su motivo",
+          fila is not None and "Cable" in (fila["motivo_desconexion"] or ""),
+          str(fila and fila["motivo_desconexion"]))
+
+    # --- desvio de reloj -----------------------------------------------------
+    repo.guardar_desvio_reloj(node_id, -3600.5)
+    fila = next((n for n in repo.listar_nodos() if n["node_id"] == node_id), None)
+    check("El desvio de reloj queda registrado",
+          fila is not None and abs(float(fila["desvio_reloj_seg"]) + 3600.5) < 0.01)
+    check("Y deja su evento RELOJ_DESVIADO",
+          any(e["tipo"] == "RELOJ_DESVIADO"
+              for e in repo.listar_eventos(limite=10, node_id=node_id)))
+
+    # --- recursos pedidos ----------------------------------------------------
+    repo.actualizar_recursos_pedidos(node_id, ["disco", "ram"])
+    _, _, pedidos = repo.registrar_nodo(node_id, "X", "h", "Linux", "1.2.3.4", 5)
+    check("El nodo readopta los recursos que le pidio el servidor",
+          pedidos == ["disco", "ram"], str(pedidos))
+
+    # --- dos servidores en la MISMA regional ---------------------------------
+    region = f"{PREFIJO}La Paz"
+    n1, n2 = f"{PREFIJO}LPZ-A", f"{PREFIJO}LPZ-B"
+    _alta(n1, region=region)
+    _alta(n2, region=region)
+    repo.guardar_metrica(n1, ahora, _metrica(usado=100.0, total=400.0))
+    repo.guardar_metrica(n2, ahora, _metrica(usado=50.0, total=200.0))
+
+    reg = next((r for r in repo.listar_regionales() if r["region"] == region), None)
+    check("Una regional puede tener DOS servidores",
+          reg is not None and int(reg["nodos"]) == 2, str(reg and reg["nodos"]))
+    check("Y su capacidad es la SUMA de los dos",
+          reg is not None and abs(float(reg["capacidad_total_gb"]) - 600.0) < 0.01,
+          str(reg and reg["capacidad_total_gb"]))
+    check("Y su % de uso sale de los totales, no del promedio",
+          reg is not None and abs(float(reg["uso_pct"]) - 25.0) < 0.01,
+          str(reg and reg["uso_pct"]))
+
+
 def _limpiar() -> None:
     """Borra todo lo que empiece con TEST-. Las metricas, eventos y mensajes
     caen solos por ON DELETE CASCADE."""
@@ -469,6 +639,7 @@ def main() -> int:
         prueba_mensajes()
         prueba_saneado()
         prueba_agregaciones()
+        prueba_v2_recursos_y_sync()
     finally:
         # Pase lo que pase: la base de Aiven es compartida.
         print("\nLimpiando datos de prueba...")
