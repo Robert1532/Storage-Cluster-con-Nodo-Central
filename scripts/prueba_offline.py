@@ -21,6 +21,7 @@ maquinas y no prueba el dashboard.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -321,6 +322,69 @@ def prueba_colectores() -> None:
           f"{len(json.dumps(lote))} bytes")
 
 
+# ================================================== 6. DASHBOARD (sintaxis)
+
+def prueba_dashboard() -> None:
+    """
+    Que el JavaScript del dashboard al menos PARSEE.
+
+    Por que existe: un error de sintaxis en ese archivo no rompe nada del lado
+    de Python — las pruebas siguen en verde, el servidor arranca, la API
+    responde — y la pantalla queda en blanco. Se descubre recien cuando alguien
+    la abre, que en el peor caso es durante la defensa.
+
+    Ya paso: al agregar un plural en una funcion se declaro `const d` cuando `d`
+    ya existia unas lineas arriba. El navegador tira "Identifier 'd' has already
+    been declared" y NO EJECUTA NADA del archivo.
+
+    Se usa Node si esta instalado. Si no esta, se avisa y se hacen las
+    comprobaciones que si se pueden hacer sin el.
+    """
+    import shutil
+    import subprocess
+
+    print("\n6. Dashboard: el JavaScript parsea y los ids existen")
+    ruta = RAIZ / "dashboard" / "index.html"
+    html = ruta.read_text(encoding="utf-8")
+
+    m = re.search(r'<script>\n"use strict";([\s\S]*?)</script>', html)
+    check("Se encuentra el bloque de JavaScript", m is not None)
+    if not m:
+        return
+    codigo = m.group(1)
+
+    if shutil.which("node"):
+        r = subprocess.run(["node", "-e",
+                            "new Function(require('fs').readFileSync(0,'utf8'))"],
+                           input=codigo, capture_output=True, text=True, timeout=30)
+        check("El JavaScript parsea sin errores de sintaxis", r.returncode == 0,
+              (r.stderr or "").strip().splitlines()[-1] if r.returncode else "")
+    else:
+        print("      (Node no esta instalado: no se puede parsear el JS)")
+
+    # Todo getElementById tiene que apuntar a un id que exista en el HTML, o a
+    # uno que el propio JS cree. Un id mal escrito no lanza: devuelve null y la
+    # pantalla se queda a medio dibujar sin decir por que.
+    ids_html = set(re.findall(r'id="([^"]+)"', html))
+    usados = set(re.findall(r'\$\("([^"]+)"\)', codigo))
+    usados |= set(re.findall(r'getElementById\("([^"]+)"\)', codigo))
+    faltan = sorted(usados - ids_html)
+    check("Todos los ids que busca el JS existen en el HTML",
+          not faltan, ", ".join(faltan))
+
+    # Las rutas de la API que usa el dashboard tienen que estar declaradas.
+    rutas_js = set(re.findall(r'["`](/api/[a-z\-]+)', codigo))
+    api = (RAIZ / "api" / "main.py").read_text(encoding="utf-8")
+    declaradas = set(re.findall(r'@app\.(?:get|post)\("([^"]+)"', api))
+    sueltas = [r for r in rutas_js
+               if r not in declaradas and not any(d.startswith(r) for d in declaradas)]
+    check("Las rutas que llama el dashboard existen en la API",
+          not sueltas, ", ".join(sueltas))
+
+    check("El dashboard sigue teniendo respaldo REST si el WebSocket falla",
+          "cargarREST" in codigo and "onclose" in codigo)
+
+
 def main() -> int:
     print("=" * 70)
     print(" PRUEBA OFFLINE (sin MySQL) - Storage Cluster CNS v2")
@@ -330,6 +394,7 @@ def main() -> int:
     prueba_recursos()
     prueba_almacen()
     prueba_colectores()
+    prueba_dashboard()
 
     print("\n" + "=" * 70)
     if fallos:

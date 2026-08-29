@@ -499,6 +499,56 @@ concurrencia; no se pierde ni un dato.
 
 ---
 
+### 2.14 Recursos: de una lista plana a una tarjeta por servidor
+
+Con datos reales aparecieron cuatro problemas en el panel de recursos, y los
+cuatro eran de presentación, no de medición:
+
+**"7 GB de 7 GB" al 90 %.** Los tres números se contradecían. El formateador
+redondeaba a cero decimales todo lo menor a 1 TB, así que una RAM de 7,42 GB
+con 6,69 GB usados salía como "7 GB de 7 GB". Y un pendrive de 410 MB salía
+"0 GB". Ahora la precisión **depende de la magnitud**: TB con dos decimales, GB
+con uno o dos según el tamaño, y por debajo de 1 GB se muestra en MB.
+
+**La red decía "kbps" y eran KB/s.** El cálculo siempre estuvo en bytes; la
+etiqueta mentía por un factor de ocho. Las claves pasaron a llamarse `rx_kb_s`
+y `tx_kb_s`, y el dashboard las muestra como `↓ recibe 8,18 KB/s`.
+
+**Un pendrive que ya no está seguía apareciendo como si estuviera.** La vista
+`v_recursos_ultimo` devuelve la última medición de cada recurso **sin límite de
+tiempo**: una unidad enchufada ayer se mostraba hoy con los números de ayer.
+Ahora la consulta trae `segundos_desde`, y un recurso medido hace más de seis
+veces el intervalo del nodo se muestra atenuado y con la leyenda *"ya no se
+reporta · última medición hace 1 día"*.
+
+**La tabla no servía para la CPU ni para la red.** Tenía columnas Capacidad y
+Usado, que esos recursos no tienen: media tabla eran guiones, y el nombre del
+servidor se repetía en cada fila. Ahora es **una tarjeta por servidor** con sus
+recursos adentro, y cada tipo se dibuja como corresponde: lo que tiene
+capacidad lleva medidor, y lo que no lleva sus propios datos con sus unidades
+(núcleos, frecuencia, carga, KB/s, errores). Hay un **selector para ver un solo
+servidor**, y la tabla sigue disponible a un clic para quien quiera comparar.
+
+Además, **el detalle de un nodo (menú ⋮) ahora muestra sus recursos**: ya no
+hay que buscarlo en una lista de sesenta filas.
+
+### 2.15 Un error de sintaxis que habría dejado la pantalla en blanco
+
+Al agregar el plural de "día" se declaró `const d` en una función donde `d` ya
+existía. El navegador tira `Identifier 'd' has already been declared` y **no
+ejecuta nada** del archivo: el dashboard queda completamente en blanco. Nada
+del lado de Python lo detecta — las pruebas siguen en verde, el servidor
+arranca, la API responde.
+
+Se agregó una sección a `scripts/prueba_offline.py` que comprueba que el
+JavaScript del dashboard parsee, que todos los `id` que busca existan en el
+HTML, y que las rutas de API que llama estén declaradas en `api/main.py`. Son
+cuatro comprobaciones que corren en un segundo y cubren una clase de fallo que
+sólo se descubría abriendo la página.
+
+
+---
+
 ## 3. Archivos
 
 ### Nuevos
@@ -510,6 +560,9 @@ concurrencia; no se pierde ni un dato.
 | `db/migracion_v2.sql` | v1 → v2 sin borrar datos. Idempotente |
 | `scripts/prueba_offline.py` | 45 comprobaciones sin MySQL |
 | `scripts/unirse.py` | Une esta computadora al clúster en un comando |
+| `db/instalar.sql` | **Script completo y final de la base**: crea base, usuario, 5 tablas y 5 vistas |
+| `docs/ARQUITECTURA-Y-TECNOLOGIAS.md` | Qué usamos, cómo está armado y por qué se eligió cada cosa |
+| `docs/INFORME.md` | Informe corto (una página y media) |
 | `docs/ACTUALIZACIONES.md` | Este documento |
 | `docs/COMO-AGREGAR-UN-NODO.md` | Departamento vs sede vs nodo, y cómo suma su laptop el ingeniero |
 | `.gitattributes` | Finales de línea LF en todo el repositorio |

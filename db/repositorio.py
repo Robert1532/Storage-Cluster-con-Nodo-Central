@@ -444,8 +444,18 @@ def avanzar_seq(node_id: str, seq: int) -> None:
 
 def recursos_actuales(node_id: str | None = None) -> list[dict[str, Any]]:
     """Ultima medicion de cada recurso. Alimenta el panel de RAM/CPU/discos."""
+    # segundos_desde: cuanto hace que se midio ESE recurso.
+    #
+    # Hace falta porque v_recursos_ultimo devuelve la ultima medicion de cada
+    # recurso SIN limite de tiempo. Un pendrive que estuvo enchufado ayer sigue
+    # apareciendo hoy como si estuviera puesto, con los numeros de ayer. Sin
+    # este dato, el dashboard no tiene forma de distinguir "esta ahi" de
+    # "estuvo ahi". Se calcula en SQL y no en el navegador porque la
+    # comparacion tiene que ser contra el reloj del SERVIDOR: el de la maquina
+    # que abre el dashboard puede estar en cualquier hora.
     sql = """SELECT node_id, tipo, nombre, timestamp, metricas, etiquetas,
-                    origen, total_gb, usado_gb, uso_pct
+                    origen, total_gb, usado_gb, uso_pct,
+                    TIMESTAMPDIFF(SECOND, timestamp, NOW()) AS segundos_desde
                FROM v_recursos_ultimo"""
     params: tuple = ()
     if node_id:

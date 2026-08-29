@@ -195,6 +195,10 @@ class RecursoOut(BaseModel):
     total_gb: float | None = None
     usado_gb: float | None = None
     uso_pct: float | None = None
+    # Cuanto hace que se midio. Un recurso que dejo de reportarse (el pendrive
+    # que sacaron) sigue teniendo su ultima medicion guardada: esto es lo que
+    # permite al dashboard mostrarlo como historico y no como estado actual.
+    segundos_desde: int | None = None
 
 
 class PuntoRecurso(BaseModel):

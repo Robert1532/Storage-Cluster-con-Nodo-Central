@@ -492,7 +492,13 @@ def _colector_cpu() -> list[dict]:
 @colector("red")
 def _colector_red() -> list[dict]:
     """
-    Trafico de red agregado, en KB/s, por diferencia entre dos lecturas.
+    Trafico de red agregado, en KILOBYTES por segundo (KB/s), por diferencia
+    entre dos lecturas.
+
+    OJO CON EL NOMBRE: la version anterior llamaba a estas claves "rx_kbps" y
+    "tx_kbps", y eso esta mal. "kbps" significa kilo-BITS por segundo, que es
+    ocho veces mas grande. El calculo siempre fue en bytes; era la etiqueta la
+    que mentia. Ahora se llaman rx_kb_s / tx_kb_s.
 
     Para un cluster que replica historiales clinicos, saber que un nodo esta
     saturando su enlace explica una latencia de disco que de otro modo no se
@@ -525,8 +531,8 @@ def _colector_red() -> list[dict]:
     return [protocolo.recurso(
         protocolo.REC_RED, "total",
         {
-            "rx_kbps": round(d_rx / dt / 1024, 2),
-            "tx_kbps": round(d_tx / dt / 1024, 2),
+            "rx_kb_s": round(d_rx / dt / 1024, 2),
+            "tx_kb_s": round(d_tx / dt / 1024, 2),
             "errores": max(0, actual["err"] - anterior["err"]),
             "descartes": max(0, actual["drop"] - anterior["drop"]),
         },

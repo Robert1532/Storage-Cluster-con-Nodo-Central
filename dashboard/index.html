@@ -209,6 +209,42 @@
   .tag.usb{background:rgba(63,184,176,.16);color:var(--acc)}
   .t-caida{font-size:10.5px;color:#e08f8f;margin-top:7px;line-height:1.45}
 
+  /* ------------------------------------------------------- recursos */
+  .alterna{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .alterna button{background:transparent;border:none;border-radius:0;padding:4px 11px;
+                  font-size:11.5px;color:var(--soft);font-weight:600}
+  .alterna button.on{background:var(--acc);color:#0e1217}
+  .alterna button:hover:not(.on){background:var(--card2);color:var(--txt)}
+
+  .rec-rejilla{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));
+               gap:13px;margin-top:12px}
+  .rec-card{background:var(--card2);border:1px solid var(--line);border-radius:9px;padding:13px 14px}
+  .rec-card > header{position:static;background:none;backdrop-filter:none;border:none;
+                     padding:0 0 9px;margin-bottom:9px;border-bottom:1px solid var(--line);
+                     display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .rec-card h4{margin:0;font-size:13.5px;font-weight:650}
+  .rec-card .dep{font-size:11px;color:var(--soft)}
+  .rec-card .id{font-size:10px;color:var(--tenue);margin-left:auto}
+
+  .rec{padding:8px 0;border-top:1px solid rgba(40,49,61,.6)}
+  .rec:first-of-type{border-top:none;padding-top:2px}
+  .rec.vieja{opacity:.5}
+  .rec-tope{display:flex;align-items:baseline;gap:7px;margin-bottom:5px;flex-wrap:wrap}
+  .rec-tipo{font-size:9.5px;font-weight:800;letter-spacing:.07em;padding:2px 6px;
+            border-radius:4px;background:#232c38;color:var(--soft)}
+  .rec-nombre{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;
+              white-space:nowrap;max-width:150px}
+  .rec-cifra{margin-left:auto;font-size:12px;color:var(--soft);white-space:nowrap}
+  .rec-cifra b{color:var(--txt)}
+  .rec-medidor{display:flex;align-items:center;gap:9px}
+  .rec-medidor .pista{flex:1;height:7px}
+  .rec-medidor .pct{font-size:12px;font-weight:700;min-width:46px;text-align:right}
+  .rec-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+  .chip-dato{font-size:11px;color:var(--tenue);background:#232c38;padding:2px 8px;border-radius:5px}
+  .chip-dato b{color:var(--txt);font-weight:600}
+  .rec-nota{font-size:10px;color:var(--tenue);margin-top:4px}
+  .rec-nota.aviso{color:var(--warn)}
+
   /* ------------------------------------------------------------- tablas */
   .tabla-wrap{overflow-x:auto;margin-top:10px}
   table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:700px}
@@ -242,6 +278,7 @@
   .modal-fondo.visible{display:flex}
   .modal{background:var(--card);border:1px solid var(--line);border-radius:12px;
          padding:20px;width:400px;max-height:92vh;overflow-y:auto;position:relative}
+  #modalDetalleFondo .modal{width:460px}
   .modal h3{margin:0 0 3px;font-size:16px}
   .modal .sub{font-size:11.5px;color:var(--tenue);margin-bottom:15px}
   .modal-x{position:absolute;top:13px;right:13px;background:none;border:none;
@@ -359,7 +396,8 @@
   <section style="margin-top:26px">
     <div class="panel-cab" style="margin-bottom:14px">
       <h2 style="font-size:15px">Servidores por regional</h2>
-      <span class="pregunta">ordenados por regional · clic para enviar un mensaje · ⋮ para el detalle ·
+      <span class="pregunta">ordenados por regional · clic para enviar un mensaje o cambiar qué mide ·
+        <b style="color:var(--soft)">⋮ para ver el detalle y sus recursos</b> ·
         la mini-línea es la tendencia de las últimas 6 h, con escala propia</span>
     </div>
     <div id="regionales"></div>
@@ -368,11 +406,15 @@
   <!-- 8. RECURSOS -->
   <section class="panel">
     <div class="panel-cab">
-      <h2>Recursos por nodo</h2>
+      <h2>Recursos por servidor</h2>
       <span class="pregunta">RAM, CPU, red y discos adicionales</span>
-      <span class="dato">Lo que reporta cada nodo se configura desde su menú ⋮</span>
+      <select id="filtroNodo" class="mini" title="Ver un servidor en particular"></select>
+      <div class="alterna" id="vistaRecursos">
+        <button class="on" data-vista="tarjetas">Tarjetas</button>
+        <button data-vista="tabla">Tabla</button>
+      </div>
     </div>
-    <div class="tabla-wrap"><table id="tablaRecursos"></table></div>
+    <div id="recursosCont"></div>
   </section>
 
   <!-- 9. BITACORA -->
@@ -400,6 +442,8 @@
       <div><b id="detalleUsado" style="display:block;font-size:15px;color:var(--txt)"></b>usado</div>
       <div style="text-align:right"><b id="detalleLibre" style="display:block;font-size:15px;color:var(--txt)"></b>libre</div>
     </div>
+    <div class="sep">Recursos de este servidor</div>
+    <div id="detalleRecursos"></div>
     <div class="sep">Ficha técnica</div>
     <div class="ficha" id="detalleFicha"></div>
   </div>
@@ -474,17 +518,26 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num = v => (v === null || v === undefined || isNaN(Number(v))) ? null : Number(v);
 
+const cifra = (n, d) => n.toLocaleString("es-BO",
+  {minimumFractionDigits:d, maximumFractionDigits:d});
+
+// Precision SEGUN LA MAGNITUD, no fija.
+//
+// Con "0 decimales para todo lo menor a 1 TB" pasaba esto de verdad: una RAM
+// de 7,4 GB con 6,7 GB usados se mostraba como "7 GB de 7 GB" al 90 % — tres
+// numeros que se contradicen entre si. Y un pendrive de 400 MB salia "0 GB".
+// Cuanto mas chico es el numero, mas decimales necesita para significar algo.
 const gb = v => {
   const n = num(v);
   if (n === null) return "—";
-  if (n >= 1024) return (n/1024).toLocaleString("es-BO",{maximumFractionDigits:1}) + " TB";
-  return n.toLocaleString("es-BO",{maximumFractionDigits:0}) + " GB";
+  if (n >= 1024) return cifra(n/1024, 2) + " TB";
+  if (n >= 100)  return cifra(n, 0) + " GB";
+  if (n >= 10)   return cifra(n, 1) + " GB";
+  if (n >= 1)    return cifra(n, 2) + " GB";
+  if (n > 0)     return cifra(n*1024, 0) + " MB";
+  return "0 GB";
 };
-const gbExacto = v => {
-  const n = num(v);
-  return n === null ? "—"
-    : n.toLocaleString("es-BO",{minimumFractionDigits:1,maximumFractionDigits:1}) + " GB";
-};
+const gbExacto = gb;
 
 // La API devuelve DATETIME de MySQL sin zona y todo se guarda en UTC. Sin la Z
 // el navegador lo lee como hora local y todo sale corrido cuatro horas: ese
@@ -502,7 +555,8 @@ const hace = t => {
   if(s<0) return "recién"; if(s<60) return "hace instantes";
   if(s<3600) return `hace ${Math.floor(s/60)} min`;
   if(s<86400) return `hace ${Math.floor(s/3600)} h`;
-  return `hace ${Math.floor(s/86400)} días`;
+  const dias = Math.floor(s/86400);          // `d` ya es la fecha, mas arriba
+  return `hace ${dias} ${dias === 1 ? "día" : "días"}`;
 };
 
 async function pedir(ruta){
@@ -1039,7 +1093,7 @@ function tarjeta(n){
         <span class="dep">${esc(n.region)}</span>
         <small>${esc(n.node_id)}</small>
       </div>
-      <button class="t-menu" data-node="${esc(n.node_id)}" title="Ver detalle">⋮</button>
+      <button class="t-menu" data-node="${esc(n.node_id)}" title="Ver detalle y recursos">⋮</button>
     </div>
     <div class="t-cifras">
       <span class="t-pct num" style="color:${color}">${on ? pct.toFixed(1)+"%" : "—"}</span>
@@ -1059,30 +1113,180 @@ function tarjeta(n){
   </div>`;
 }
 
-/* -------------------------------------------------------------- recursos */
-const NOMBRE_TIPO = {DISCO:"Disco", RAM:"Memoria", CPU:"CPU", RED:"Red", CUSTOM:"Otro"};
+/* =========================================================================
+   RECURSOS
+   -------------------------------------------------------------------------
+   Antes era una tabla plana de seis columnas: una fila por recurso, con el
+   nombre del servidor repetido en cada una. Para leer "que tiene el servidor
+   de Cercado" había que ir juntando filas con la vista. Y las columnas
+   Capacidad/Usado quedaban vacías para la CPU y la red, que no tienen
+   capacidad — media tabla eran guiones.
+
+   Ahora es una tarjeta por servidor, con sus recursos adentro, y cada tipo se
+   dibuja como corresponde: lo que tiene capacidad lleva medidor, y lo que no
+   (CPU, red) lleva sus propios datos con sus unidades. La tabla sigue estando,
+   un clic más allá, para quien quiera ordenar y comparar.
+   ========================================================================= */
+const NOMBRE_TIPO = {DISCO:"DISCO", RAM:"MEMORIA", CPU:"CPU", RED:"RED", CUSTOM:"OTRO"};
+
+// Cómo se llama y en qué unidad va cada métrica suelta (las que no son
+// total/usado/%). Lo que no esté acá se muestra con su propio nombre: el
+// sistema acepta métricas que nadie previó, así que la tabla no puede ser
+// una condición para mostrarlas.
+const ETIQUETA = {
+  rx_kb_s:"↓ recibe", tx_kb_s:"↑ envía", errores:"errores", descartes:"descartes",
+  nucleos:"núcleos", nucleos_fisicos:"núcleos físicos", frecuencia_mhz:"frecuencia",
+  carga_1min:"carga 1 min", carga_5min:"carga 5 min", carga_15min:"carga 15 min",
+  temperatura_c:"temperatura", iops_lectura:"IOPS lectura",
+  iops_escritura:"IOPS escritura", latencia_ms:"latencia",
+};
+function valorMetrica(clave, v){
+  const n = Number(v);
+  if (clave === "frecuencia_mhz") return n >= 1000 ? cifra(n/1000,2)+" GHz" : cifra(n,0)+" MHz";
+  if (clave === "temperatura_c")  return cifra(n,1) + " °C";
+  if (clave.endsWith("_kb_s"))    return (n >= 1024 ? cifra(n/1024,2)+" MB/s" : cifra(n,2)+" KB/s");
+  if (clave === "latencia_ms")    return cifra(n,3) + " ms";
+  if (clave.startsWith("carga"))  return cifra(n,2);
+  return Number.isInteger(n) ? n.toLocaleString("es-BO") : cifra(n,2);
+}
+
+// Un recurso se considera VIGENTE si se midió hace menos de seis veces el
+// intervalo del nodo (con un piso de dos minutos). Pasado eso ya no describe
+// el presente: es el pendrive que alguien sacó, y mostrarlo como si siguiera
+// enchufado es peor que no mostrarlo.
+function estaVigente(r, n){
+  const seg = num(r.segundos_desde);
+  if (seg === null) return true;
+  return seg <= Math.max(120, (Number(n?.intervalo_seg) || 10) * 6);
+}
+
+function filaRecurso(r, n){
+  const m = r.metricas || {}, e = r.etiquetas || {};
+  const pct = num(r.uso_pct);
+  const vigente = estaVigente(r, n);
+  const total = num(r.total_gb), usado = num(r.usado_gb);
+
+  const marcas = [];
+  if (e.principal === "si") marcas.push(`<span class="chip-dato">principal</span>`);
+  if (e.removible === "si") marcas.push(`<span class="tag usb">EXTRAÍBLE</span>`);
+  if (e.tipo && r.tipo === "DISCO" && e.tipo !== "USB")
+    marcas.push(`<span class="chip-dato">${esc(e.tipo)}</span>`);
+  if (r.origen === "SYNC") marcas.push(`<span class="tag sync">SYNC</span>`);
+
+  // Las métricas que no son capacidad ni porcentaje: para la CPU y la red son
+  // TODO lo que hay, así que no pueden quedar escondidas en un tooltip.
+  const sueltas = Object.entries(m)
+    .filter(([k]) => !["total_gb","usado_gb","libre_gb","uso_pct"].includes(k))
+    .map(([k,v]) => `<span class="chip-dato">${esc(ETIQUETA[k] || k.replace(/_/g," "))}
+        <b>${esc(valorMetrica(k,v))}</b></span>`).join("");
+
+  return `<div class="rec ${vigente?"":"vieja"}">
+    <div class="rec-tope">
+      <span class="rec-tipo">${esc(NOMBRE_TIPO[r.tipo] || r.tipo)}</span>
+      <span class="rec-nombre" title="${esc(r.nombre)}">${esc(r.nombre)}</span>
+      ${marcas.join("")}
+      ${total !== null ? `<span class="rec-cifra"><b>${gb(usado)}</b> de ${gb(total)}</span>` : ""}
+    </div>
+    ${pct !== null ? `<div class="rec-medidor">
+       <div class="pista"><i style="width:${Math.min(100,Math.max(0,pct))}%;
+            background:${colorDeUso(pct)}"></i></div>
+       <span class="pct num" style="color:${colorDeUso(pct)}">${cifra(pct,1)}%</span>
+     </div>` : ""}
+    ${sueltas ? `<div class="rec-chips">${sueltas}</div>` : ""}
+    ${vigente
+      ? (pct === null && !sueltas ? `<div class="rec-nota">sin datos</div>` : "")
+      : `<div class="rec-nota aviso">ya no se reporta · última medición ${esc(hace(r.timestamp))}</div>`}
+  </div>`;
+}
+
+function tarjetaRecursos(n, lista){
+  return `<div class="rec-card">
+    <header>
+      <h4>${esc(n.sede || n.region)}</h4>
+      <span class="dep">${esc(n.region)}</span>
+      <span class="id">${esc(n.node_id)}</span>
+    </header>
+    ${lista.length
+      ? lista.map(r => filaRecurso(r, n)).join("")
+      : `<div class="rec-nota">Este servidor sólo reporta el disco principal.
+          Se le pueden pedir más recursos desde su menú ⋮.</div>`}
+  </div>`;
+}
+
+let vistaRecursos = "tarjetas";
+let filtroNodo = "";
+
 function pintarRecursos(){
-  const t = $("tablaRecursos");
+  const cont = $("recursosCont");
+  const sel = $("filtroNodo");
+
+  // El selector se reconstruye sólo si cambió la lista: si no, se perdería la
+  // opción elegida en cada refresco (y hay uno por segundo).
+  const firma = nodos.map(n => n.node_id).join("|");
+  if (sel.dataset.firma !== firma){
+    sel.dataset.firma = firma;
+    sel.innerHTML = `<option value="">Todos los servidores</option>` +
+      [...nodos].sort((a,b) => a.region.localeCompare(b.region))
+        .map(n => `<option value="${esc(n.node_id)}">${esc(n.sede || n.region)} — ${esc(n.region)}</option>`)
+        .join("");
+    if (nodos.some(n => n.node_id === filtroNodo)) sel.value = filtroNodo;
+    else filtroNodo = "";
+  }
+
+  const visibles = filtroNodo ? recursos.filter(r => r.node_id === filtroNodo) : recursos;
+
   if (!recursos.length){
-    t.innerHTML = `<tbody><tr><td class="vacio">Ningún nodo está reportando recursos
-      extra todavía. Se activan por nodo desde su menú ⋮, o al arrancar el cliente
-      con <code>--recursos disco,discos,ram,cpu</code>.</td></tr></tbody>`;
+    cont.innerHTML = `<div class="vacio">Ningún servidor está reportando recursos extra
+      todavía. Se activan por nodo desde su menú ⋮, o al arrancar el cliente con
+      <code>--recursos disco,discos,ram,cpu</code>.</div>`;
     return;
   }
+
+  if (vistaRecursos === "tabla"){ pintarTablaRecursos(visibles); return; }
+
+  const porNodo = new Map();
+  visibles.forEach(r => {
+    if (!porNodo.has(r.node_id)) porNodo.set(r.node_id, []);
+    porNodo.get(r.node_id).push(r);
+  });
+
+  const orden = nodos
+    .filter(n => porNodo.has(n.node_id))
+    .sort((a,b) => a.region.localeCompare(b.region) ||
+                   String(a.sede||"").localeCompare(String(b.sede||"")));
+
+  cont.innerHTML = orden.length
+    ? `<div class="rec-rejilla">${orden.map(n =>
+        tarjetaRecursos(n, ordenarRecursos(porNodo.get(n.node_id)))).join("")}</div>`
+    : `<div class="vacio">Ese servidor no está reportando recursos extra.</div>`;
+}
+
+// Orden fijo: primero lo que ocupa espacio (discos, memoria), después lo que
+// no (CPU, red). Que el orden no dependa de cómo los devolvió la base hace que
+// la vista no baile entre refrescos.
+const PESO_TIPO = {DISCO:0, RAM:1, CPU:2, RED:3, CUSTOM:4};
+const ordenarRecursos = lista => [...lista].sort((a,b) =>
+  (PESO_TIPO[a.tipo] ?? 9) - (PESO_TIPO[b.tipo] ?? 9) ||
+  (b.etiquetas?.principal === "si" ? 1 : 0) - (a.etiquetas?.principal === "si" ? 1 : 0) ||
+  String(a.nombre).localeCompare(String(b.nombre)));
+
+function pintarTablaRecursos(visibles){
   const donde = {};
   nodos.forEach(n => donde[n.node_id] = n);
-
-  t.innerHTML = `<thead><tr>
+  $("recursosCont").innerHTML = `<div class="tabla-wrap"><table><thead><tr>
       <th>Servidor</th><th>Tipo</th><th>Recurso</th>
-      <th>Capacidad</th><th>Usado</th><th style="width:170px">Utilización</th><th>Medido</th>
-    </tr></thead><tbody>` + recursos.map(r => {
+      <th>Capacidad</th><th>Usado</th><th style="width:170px">Utilización</th>
+      <th>Otros datos</th><th>Medido</th>
+    </tr></thead><tbody>` + ordenarRecursos(visibles).map(r => {
     const n = donde[r.node_id] || {};
     const m = r.metricas || {}, e = r.etiquetas || {};
     const pct = num(r.uso_pct);
-    const otras = Object.entries(m)
+    const vigente = estaVigente(r, n);
+    const sueltas = Object.entries(m)
       .filter(([k]) => !["total_gb","usado_gb","libre_gb","uso_pct"].includes(k))
-      .map(([k,v]) => `${esc(k.replace(/_/g," "))} <b>${esc(String(v))}</b>`).join(" · ");
-    return `<tr>
+      .map(([k,v]) => `${esc(ETIQUETA[k] || k.replace(/_/g," "))} <b>${esc(valorMetrica(k,v))}</b>`)
+      .join(" · ");
+    return `<tr style="${vigente?"":"opacity:.5"}">
       <td>${esc(n.sede || r.node_id)}<div style="font-size:10.5px;color:var(--tenue)">${esc(r.node_id)}</div></td>
       <td>${esc(NOMBRE_TIPO[r.tipo] || r.tipo)}</td>
       <td>${esc(r.nombre)}
@@ -1094,13 +1298,23 @@ function pintarRecursos(){
         ? `<div style="display:flex;align-items:center;gap:8px">
              <div class="pista" style="flex:1;height:6px"><i style="width:${Math.min(100,Math.max(0,pct))}%;
                background:${colorDeUso(pct)}"></i></div>
-             <span class="num" style="font-size:11.5px;min-width:38px;text-align:right">${pct.toFixed(1)}%</span></div>`
-        : `<span style="font-size:11.5px;color:var(--soft)">${otras || "—"}</span>`}</td>
-      <td style="font-size:11px;color:var(--tenue)">${esc(hace(r.timestamp))}
-        ${r.origen === "SYNC" ? `<span class="tag sync" style="margin-left:5px">SYNC</span>` : ""}</td>
+             <span class="num" style="font-size:11.5px;min-width:44px;text-align:right">${cifra(pct,1)}%</span></div>`
+        : "—"}</td>
+      <td style="font-size:11.5px;color:var(--soft)">${sueltas || "—"}</td>
+      <td style="font-size:11px;color:${vigente?"var(--tenue)":"var(--warn)"}">${esc(hace(r.timestamp))}
+        ${r.origen === "SYNC" ? `<span class="tag sync" style="margin-left:5px">SYNC</span>` : ""}
+        ${vigente ? "" : `<div style="font-size:10px">ya no se reporta</div>`}</td>
     </tr>`;
-  }).join("") + "</tbody>";
+  }).join("") + "</tbody></table></div>";
 }
+
+$("filtroNodo").onchange = function(){ filtroNodo = this.value; pintarRecursos(); };
+$("vistaRecursos").onclick = ev => {
+  const b = ev.target.closest("button"); if (!b) return;
+  vistaRecursos = b.dataset.vista;
+  [...ev.currentTarget.children].forEach(x => x.classList.toggle("on", x === b));
+  pintarRecursos();
+};
 
 /* -------------------------------------------------------------- bitácora */
 const CLASE_EV = {
@@ -1190,6 +1404,17 @@ function refrescarDetalle(node_id){
 
   $("detalleFicha").innerHTML = filas
     .map(([k,v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join("");
+
+  // Los recursos de ESTE servidor, con el mismo dibujo que el panel de abajo.
+  // Es la respuesta a "quiero ver los recursos del nodo sin buscarlo en una
+  // lista de sesenta filas".
+  const suyos = ordenarRecursos(recursos.filter(r => r.node_id === node_id));
+  $("detalleRecursos").innerHTML = suyos.length
+    ? suyos.map(r => filaRecurso(r, n)).join("") +
+      `<div class="rec-nota" style="margin-top:8px">Para que mida otra cosa:
+        cerrá esta ventana y hacé clic en la tarjeta del servidor.</div>`
+    : `<div class="rec-nota">Sólo reporta el disco principal. Para pedirle RAM, CPU
+        o red: cerrá esta ventana y hacé clic en la tarjeta del servidor.</div>`;
 }
 
 const cerrarDetalle = () => { nodoAbierto = null;
